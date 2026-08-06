@@ -6,90 +6,125 @@ import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.model.ContentType
 import org.koitharu.kotatsu.parsers.model.Manga
 import org.koitharu.kotatsu.parsers.model.MangaChapter
+import org.koitharu.kotatsu.parsers.model.MangaListFilter
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
-import org.koitharu.kotatsu.parsers.model.MangaTag
+import org.koitharu.kotatsu.parsers.model.SortOrder
+import org.koitharu.kotatsu.parsers.model.MangaState
+import org.koitharu.kotatsu.parsers.model.ContentRating
 import org.koitharu.kotatsu.parsers.site.madara.MadaraParser
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.model.MangaListFilterOptions
 import java.text.SimpleDateFormat
+import java.util.*
 
 @MangaSourceParser("MANGA_DISTRICT", "MangaDistrict", "en", ContentType.HENTAI)
 internal class MangaDistrict(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.MANGA_DISTRICT, "mangadistrict.com", pageSize = 30) {
 
 	override val tagPrefix = "publication-genre/"
-	override val withoutAjax: Boolean = true
-	override val datePattern: String = "MMMM d, yyyy"
-	override val stylePage: String = "?style=list"
 
-	override suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> {
-		val dateFormat = SimpleDateFormat(datePattern, sourceLocale)
+	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+		return try {
+			val pages = page + 1
 
-		val chapters = doc.body()
-			.select("li.wp-manga-chapter")
-			.mapNotNull { li ->
-				val a = li.selectFirstOrThrow("a")
-				val href = a.attrAsRelativeUrl("href")
-				val link = href + stylePage
+			val url = buildString {
+				append("https://")
+				append(domain)
 
-				val name = a.selectFirst("p")?.text()
-					?: a.ownText()
+				if (pages > 1) {
+					append("/page/")
+					append(pages.toString())
+				}
+				append("/?s=")
 
-				val dateText =
-					li.selectFirst("a.c-new-tag")?.attr("title")
-						?: li.selectFirst("span.chapter-release-date i")?.text()
+				filter.query?.let {
+					append(filter.query.urlEncoded())
+				}
 
-				MangaChapter(
-					id = generateUid(href),
-					title = name,
-					number = extractChapterNumber(name) ?: 0f,
-					volume = 0,
-					url = link,
-					uploadDate = parseChapterDate(dateFormat, dateText),
-					scanlator = null,
-					branch = null,
-					source = source,
-				)
+				append("&post_type=wp-manga")
+
+				if (filter.tags.isNotEmpty()) {
+					filter.tags.forEach {
+						append("&genre[]=")
+						append(it.key)
+					}
+				}
+
+				filter.states.forEach {
+					append("&status[]=")
+					when (it) {
+						MangaState.ONGOING -> append("on-going")
+						MangaState.FINISHED -> append("end")
+						MangaState.ABANDONED -> append("canceled")
+						MangaState.PAUSED -> append("on-hold")
+						MangaState.UPCOMING -> append("upcoming")
+						else -> throw IllegalArgumentException("$it not supported")
+					}
+				}
+
+				filter.contentRating.oneOrThrowIfMany()?.let {
+					append("&adult=")
+					append(
+						when (it) {
+							ContentRating.SAFE -> "0"
+							ContentRating.ADULT -> "1"
+							else -> ""
+						},
+					)
+				}
+
+				if (filter.year != 0) {
+					append("&release=")
+					append(filter.year.toString())
+				}
+
+				if (!filter.author.isNullOrEmpty()) {
+					filter.author.let {
+						append("&author=")
+						append(it.lowercase().replace(" ", "-"))
+					}
+				}
+
+				append("&m_orderby=")
+				when (order) {
+					SortOrder.POPULARITY -> append("views")
+					SortOrder.UPDATED -> append("latest")
+					SortOrder.NEWEST -> append("new-manga")
+					SortOrder.ALPHABETICAL -> append("alphabet")
+					SortOrder.RATING -> append("rating")
+					SortOrder.RELEVANCE -> {}
+					else -> {}
+				}
 			}
-			.sortedWith(
-				compareBy<MangaChapter> { it.number }
-					.thenBy { it.title }
-			)
-
-		return chapters
+			parseMangaList(webClient.httpGet(url).parseHtml())
+		} catch (e: Exception) {
+			emptyList()
+		}
 	}
-
-	private fun extractChapterNumber(name: String): Float? {
-		val match = Regex(
-			"""(?:chapter|ch\.?)\s*(\d+(?:\.\d+)?)""",
-			RegexOption.IGNORE_CASE
-		).find(name)
-
-		return match
-			?.groupValues
-			?.getOrNull(1)
-			?.toFloatOrNull()
-	}
-
-	override suspend fun fetchAvailableTags(): Set<MangaTag> {
-		val doc = webClient.httpGet("https://$domain/series/").parseHtml()
-		val elements = doc.select("header ul.second-menu li a, div.genres_wrap ul li a")
-
-		return elements.mapNotNullToSet { a ->
-			val href = a.attr("href")
-				.removeSuffix("/")
-				.substringAfterLast(tagPrefix, "")
-
-			if (href.isBlank()) return@mapNotNullToSet null
-
-			MangaTag(
-				key = href,
-				title = a.text()
-					.replace(Regex("""\s*\(\d+\)"""), "")
-					.replace(Regex("""[^\x20-\x7E]"""), "")
-					.trim()
-					.toTitleCase(),
+    
+	override suspend fun getChapters(manga: Manga, doc: Document): List<MangaChapter> {
+		val slug = manga.url.removeSuffix('/').substringAfterLast('/')
+		val doc2 = webClient.httpPost(
+			"https://$domain/series/$slug/ajax/chapters/",
+			mapOf(),
+		).parseHtml()
+		val ul = doc2.body().selectFirstOrThrow("ul")
+		val dateFormat = SimpleDateFormat(datePattern, Locale.US)
+		return ul.select("li").mapChapters(reversed = true) { i, li ->
+			val a = li.selectFirst("a")
+			val href = a?.attrAsRelativeUrlOrNull("href") ?: li.parseFailed("Link is missing")
+			MangaChapter(
+				id = generateUid(href),
+				title = a.ownText(),
+				number = i + 1f,
+				volume = 0,
+				url = href,
+				uploadDate = parseChapterDate(
+					dateFormat,
+					li.selectFirst("span.chapter-release-date i")?.text(),
+				),
 				source = source,
+				scanlator = null,
+				branch = null,
 			)
 		}
 	}
