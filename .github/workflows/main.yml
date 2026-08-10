@@ -17,7 +17,7 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.ref_name }} # Dynamically locks to active branch (no detached HEAD)
+        ref: ${{ github.ref_name }} # Dynamically locks to active branch
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -54,8 +54,11 @@ jobs:
           git checkout HEAD -- "$PROTECTED_FILE" || true
           git add "$PROTECTED_FILE"
 
-          # Commit & push back to active branch (${{ github.ref_name }})
+          # Commit changes
           git commit -m "Chore: Sync upstream changes (Preserved custom MangaDistrict.kt)" || true
+
+          # Pull remote changes first to avoid push rejection errors
+          git pull --rebase origin "${{ github.ref_name }}"
           git push origin "${{ github.ref_name }}"
 
           # Extract short 7-character SHA
