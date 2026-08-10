@@ -2,9 +2,8 @@ name: Daily Sync & JitPack Trigger
 
 on:
   schedule:
-    # Runs daily at 00:00 UTC
     - cron: '0 0 * * *'
-  workflow_dispatch: # Manual button trigger from phone
+  workflow_dispatch:
 
 jobs:
   sync-and-build:
@@ -23,39 +22,34 @@ jobs:
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-        # Protected custom parser file
         PROTECTED_FILE="src/main/kotlin/org/koitharu/kotatsu/parsers/site/madara/en/MangaDistrict.kt"
 
-        # Add original Kotatsu-Redo upstream remote
         git remote add upstream https://github.com/Kotatsu-Redo/kotatsu-parsers-redo.git || true
         git fetch upstream master
 
-        LOCAL_HASH=$(git rev-parse HEAD)
-        UPSTREAM_HASH=$(git rev-parse upstream/master)
+        # Count how many new commits upstream has that we don't have
+        NEW_COMMITS_COUNT=$(git rev-list HEAD..upstream/master --count)
+        echo "New upstream commits count: $NEW_COMMITS_COUNT"
 
-        echo "Local commit   : $LOCAL_HASH"
-        echo "Upstream commit: $UPSTREAM_HASH"
-
-        if [ "$LOCAL_HASH" = "$UPSTREAM_HASH" ]; then
-          echo "No new commits found. Fork is up to date."
+        if [ "$NEW_COMMITS_COUNT" -eq "0" ]; then
+          echo "No new commits found upstream. Fork is up to date."
           echo "has_changes=false" >> $GITHUB_OUTPUT
         else
-          echo "New commits detected! Syncing master branch while preserving custom files..."
+          echo "Found $NEW_COMMITS_COUNT new commit(s) upstream! Syncing..."
           
-          # Perform merge without auto-committing
+          # Merge without auto-committing
           git merge upstream/master --no-commit --no-ff || true
 
-          # Restore custom implementation before committing merge
-          git checkout "$LOCAL_HASH" -- "$PROTECTED_FILE"
+          # Restore your custom MangaDistrict.kt file before committing
+          git checkout HEAD -- "$PROTECTED_FILE" || true
           git add "$PROTECTED_FILE"
 
-          # Finalize merge
           git commit -m "Chore: Sync upstream changes (Preserved custom MangaDistrict.kt)" || true
           git push origin master
 
-          # Extract short 7-character SHA to match libs.versions.toml
+          # Extract the new short 7-character hash of YOUR master branch
           SHORT_HASH=$(git rev-parse --short=7 HEAD)
-          echo "Updated to commit short hash: $SHORT_HASH"
+          echo "Updated local master short hash: $SHORT_HASH"
           echo "has_changes=true" >> $GITHUB_OUTPUT
           echo "commit_hash=$SHORT_HASH" >> $GITHUB_OUTPUT
         fi
@@ -63,7 +57,6 @@ jobs:
     - name: Trigger JitPack Build
       if: steps.sync.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
       run: |
-        # Use short 7-character hash to match libs.versions.toml exactly
         COMMIT_HASH=${{ steps.sync.outputs.commit_hash }}
         if [ -z "$COMMIT_HASH" ]; then
           COMMIT_HASH=$(git rev-parse --short=7 HEAD)
