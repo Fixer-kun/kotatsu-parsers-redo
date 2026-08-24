@@ -22,6 +22,8 @@ import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
 import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
+import java.net.HttpURLConnection.HTTP_FORBIDDEN
+import java.net.HttpURLConnection.HTTP_UNAVAILABLE
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 import java.util.*
@@ -37,6 +39,10 @@ internal class Comix(context: MangaLoaderContext) :
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
         keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
+        // Lets the app resolve a challenge headlessly instead of putting a browser in
+        // front of the user: WebViewExecutor reads this key to pick its intercepting
+        // CloudFlare client.
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
     }
 
     override val filterCapabilities: MangaListFilterCapabilities
@@ -190,7 +196,7 @@ internal class Comix(context: MangaLoaderContext) :
             evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
         } catch (e: Exception) {
             if (sawCloudflare || e.isCloudFlareProtection()) {
-                throw ParseException(CLOUDFLARE_MESSAGE, browseUrl, e)
+                reportCloudflare(browseUrl, e)
             }
             throw e
         }
@@ -284,20 +290,15 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        // One fetch of the title page serves both halves: the details come out of its
-        // `script#initial-data`, and the chapter fetch only needs it for the url of
-        // the module that carries the request signing.
-        val titleUrl = manga.url.toAbsoluteUrl(domain)
-        val document = loadRenderedDocument(titleUrl) {
-            extractInitialDataDetail(it) != null || it.selectFirst(MAIN_MODULE_SELECTOR) != null
-        }
-        val chaptersDeferred = async { getChapters(manga, document) }
+        val chaptersDeferred = async { getChapters(manga) }
 
         // Enrich from the title page's `script#initial-data` (the same SSR JSON
         // the website hydrates from), so no signed API call is needed. If the
         // page is gated/empty, fall back to the listing-derived manga (which
         // already carries synopsis/tags/authors) so details still open.
-        val updatedManga = document
+        val updatedManga = loadRenderedDocument(manga.url.toAbsoluteUrl(domain)) {
+            extractInitialDataDetail(it) != null
+        }
             ?.let { extractInitialDataDetail(it) }
             ?.let { parseMangaFromJson(it) }
             ?: manga
@@ -340,7 +341,7 @@ internal class Comix(context: MangaLoaderContext) :
                 evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
             } catch (e: Exception) {
                 if (sawCloudflare || e.isCloudFlareProtection()) {
-                    throw ParseException(CLOUDFLARE_MESSAGE, readerUrl, e)
+                    reportCloudflare(readerUrl, e)
                 }
                 throw e
             }
@@ -410,6 +411,7 @@ internal class Comix(context: MangaLoaderContext) :
             }
         }
         val response = retryScramblePathFallbacks(chain, request, chain.proceed(request))
+        response.asCloudflareChallengeOrNull()?.let { return it }
         if (!response.isSuccessful) {
             return response
         }
@@ -617,9 +619,9 @@ internal class Comix(context: MangaLoaderContext) :
         return arr
     }
 
-    private suspend fun getChapters(manga: Manga, titlePage: Document?): List<MangaChapter> {
+    private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val payload = loadAllChapters(hashId, titlePage)
+        val payload = loadAllChapters(hashId)
         val rawItems = payload.optJSONArray("items") ?: return emptyList()
         val parsed = (0 until rawItems.length()).mapNotNull { rawItems.optJSONObject(it) }
         if (parsed.isEmpty()) {
@@ -696,30 +698,21 @@ internal class Comix(context: MangaLoaderContext) :
     /**
      * The title page ships no chapters in `script#initial-data` — the list comes over
      * a signed XHR after hydration — so the page's own code has to make the call for
-     * us. It does not have to *run the site*, though: we fetch the page over HTTP,
-     * strip the module that boots the SPA, and hand the WebView that shell. Nothing
-     * renders, nothing is clicked; the script pulls the signing bundle the stripped
-     * module referenced and talks to the chapter API directly.
+     * us. The script does not need the rendered list though: it pulls the signing
+     * bundle the page's main module references and talks to the chapter API directly.
      */
-    private suspend fun loadAllChapters(hashId: String, titlePage: Document?): JSONObject {
+    private suspend fun loadAllChapters(hashId: String): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
-        val document = titlePage
-            ?: loadRenderedDocument(titleUrl) { it.selectFirst(MAIN_MODULE_SELECTOR) != null }
+        val document = loadRenderedDocument(titleUrl) { it.selectFirst(MAIN_MODULE_SELECTOR) != null }
             ?: throw ParseException("Comix title page did not load", titleUrl)
         val mainScriptUrl = document.selectFirst(MAIN_MODULE_SELECTOR)?.attrAsAbsoluteUrlOrNull("src")
             ?: throw ParseException("Comix main bundle not found", titleUrl)
 
-        // Nothing from the page itself is needed — only its origin, so that the api
-        // call is same-origin and carries the site's cookies. Handing the WebView an
-        // empty document instead of the real one means no stylesheets, fonts,
-        // preloads, images or third-party scripts are fetched, and the site's own
-        // bundle never runs: the injected script is the only thing on the page.
         val response = evaluateWebViewApiJson(
             pageUrl = titleUrl,
             script = chapterScript(hashId.toJsString(), mainScriptUrl.toJsString()),
             timeoutMs = CHAPTER_WEBVIEW_TIMEOUT,
-            html = BLANK_SHELL_HTML,
         )
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
@@ -746,7 +739,6 @@ internal class Comix(context: MangaLoaderContext) :
         pageUrl: String,
         script: String,
         timeoutMs: Long = WEBVIEW_API_TIMEOUT,
-        html: String? = null,
     ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
@@ -757,7 +749,6 @@ internal class Comix(context: MangaLoaderContext) :
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
-                    html = html,
                 ),
             )
         }.getOrElse { e ->
@@ -774,9 +765,7 @@ internal class Comix(context: MangaLoaderContext) :
                 ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
         }
         if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            // The scripts bail out on a challenge instead of returning one, so this
-            // only happens when the WebView never got past it on its own.
-            throw ParseException(CLOUDFLARE_MESSAGE, pageUrl)
+            reportCloudflare(pageUrl)
         }
         if (decoded.isBlank()) {
             throw ParseException("Comix WebView API returned an empty response", pageUrl)
@@ -837,10 +826,36 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /**
+     * Hands a challenge to the app rather than dealing with it here. The request goes
+     * back out over the shared client, where it is tagged with this source and passes
+     * through the app's Cloudflare interceptor — which raises the exception its captcha
+     * handling acts on, and which [ConfigKey.InterceptCloudflare] lets it solve on its
+     * own. If the challenge has cleared in the meantime the request simply succeeds and
+     * only the retry below is left.
+     */
+    private suspend fun reportCloudflare(url: String, cause: Throwable? = null): Nothing {
+        runCatchingCancellable { webClient.httpGet(url).close() }
+            .onFailure { if (it.isCloudFlareProtection()) throw it }
+        throw ParseException(CLOUDFLARE_MESSAGE, url, cause)
+    }
+
+    /**
+     * The app only recognises a challenge on a 403/503, but Comix serves its interstitial
+     * with an ordinary status. Restamping it here — this interceptor runs inside the
+     * app's — is what lets the app classify it and attribute it to this source.
+     */
+    private fun Response.asCloudflareChallengeOrNull(): Response? {
+        if (code == HTTP_FORBIDDEN || code == HTTP_UNAVAILABLE) return null
+        val body = runCatching { peekBody(CHALLENGE_PEEK_BYTES).string() }.getOrNull() ?: return null
+        if (!isCloudflarePage(body)) return null
+        // Only worth restamping if the markers the app looks for are actually present.
+        if (!body.contains("challenge-error-title") && !body.contains("challenge-error-text")) return null
+        return newBuilder().code(HTTP_FORBIDDEN).message("Forbidden").build()
+    }
+
+    /**
      * The app raises its own Cloudflare exception from a module this library cannot
-     * reference by type, so it is recognised by name instead. Without this the plain
-     * first-pass GET swallows the challenge and the failure surfaces later as an
-     * unrelated parse error.
+     * reference by type, so it is recognised by name instead.
      */
     private fun Throwable.isCloudFlareProtection(): Boolean {
         var error: Throwable? = this
@@ -1011,6 +1026,7 @@ internal class Comix(context: MangaLoaderContext) :
         // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
         private const val SECONDS_TIMESTAMP_LIMIT = 10_000_000_000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
+        private const val CHALLENGE_PEEK_BYTES = 128L * 1024L
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
@@ -1019,7 +1035,6 @@ internal class Comix(context: MangaLoaderContext) :
 
         private const val CAUSE_CHAIN_LIMIT = 8
         private const val MAIN_MODULE_SELECTOR = "script[type=module][src*=/dist/main-]"
-        private const val BLANK_SHELL_HTML = "<!doctype html><html><head></head><body></body></html>"
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 

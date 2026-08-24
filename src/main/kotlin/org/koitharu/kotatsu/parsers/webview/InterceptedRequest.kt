@@ -83,13 +83,5 @@ public data class InterceptionConfig(
     public val maxRequests: Int = 100,
     public val urlPattern: Regex? = null,
     public val filterScript: String? = null,   // JS containing predicate (last return)
-    public val pageScript: String? = null,     // JS to actually run in the page
-    /**
-     * HTML to load instead of navigating to the url, which then serves only as the
-     * document's base — so the origin, and with it cookies and same-origin requests,
-     * still belong to the site. Lets a parser hand the WebView a page it has already
-     * fetched, stripped of the scripts it does not want run, instead of paying for a
-     * full page load and whatever the site's own bundle decides to do.
-     */
-    public val html: String? = null,
+    public val pageScript: String? = null      // JS to actually run in the page
 )
