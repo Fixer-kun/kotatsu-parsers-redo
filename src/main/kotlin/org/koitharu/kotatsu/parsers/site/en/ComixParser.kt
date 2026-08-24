@@ -284,15 +284,20 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
-        val chaptersDeferred = async { getChapters(manga) }
+        // One fetch of the title page serves both halves: the details come out of its
+        // `script#initial-data`, and the chapter fetch only needs it for the url of
+        // the module that carries the request signing.
+        val titleUrl = manga.url.toAbsoluteUrl(domain)
+        val document = loadRenderedDocument(titleUrl) {
+            extractInitialDataDetail(it) != null || it.selectFirst(MAIN_MODULE_SELECTOR) != null
+        }
+        val chaptersDeferred = async { getChapters(manga, document) }
 
         // Enrich from the title page's `script#initial-data` (the same SSR JSON
         // the website hydrates from), so no signed API call is needed. If the
         // page is gated/empty, fall back to the listing-derived manga (which
         // already carries synopsis/tags/authors) so details still open.
-        val updatedManga = loadRenderedDocument(manga.url.toAbsoluteUrl(domain)) {
-            extractInitialDataDetail(it) != null
-        }
+        val updatedManga = document
             ?.let { extractInitialDataDetail(it) }
             ?.let { parseMangaFromJson(it) }
             ?: manga
@@ -612,9 +617,9 @@ internal class Comix(context: MangaLoaderContext) :
         return arr
     }
 
-    private suspend fun getChapters(manga: Manga): List<MangaChapter> {
+    private suspend fun getChapters(manga: Manga, titlePage: Document?): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
-        val payload = loadAllChapters(hashId)
+        val payload = loadAllChapters(hashId, titlePage)
         val rawItems = payload.optJSONArray("items") ?: return emptyList()
         val parsed = (0 until rawItems.length()).mapNotNull { rawItems.optJSONObject(it) }
         if (parsed.isEmpty()) {
@@ -696,23 +701,25 @@ internal class Comix(context: MangaLoaderContext) :
      * renders, nothing is clicked; the script pulls the signing bundle the stripped
      * module referenced and talks to the chapter API directly.
      */
-    private suspend fun loadAllChapters(hashId: String): JSONObject {
+    private suspend fun loadAllChapters(hashId: String, titlePage: Document?): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
-        val document = loadRenderedDocument(titleUrl) { it.selectFirst(MAIN_MODULE_SELECTOR) != null }
+        val document = titlePage
+            ?: loadRenderedDocument(titleUrl) { it.selectFirst(MAIN_MODULE_SELECTOR) != null }
             ?: throw ParseException("Comix title page did not load", titleUrl)
-        val mainModule = document.selectFirst(MAIN_MODULE_SELECTOR)
+        val mainScriptUrl = document.selectFirst(MAIN_MODULE_SELECTOR)?.attrAsAbsoluteUrlOrNull("src")
             ?: throw ParseException("Comix main bundle not found", titleUrl)
-        val mainScriptUrl = mainModule.attrAsAbsoluteUrlOrNull("src")
-            ?: throw ParseException("Comix main bundle not found", titleUrl)
-        // Removing it is what keeps the SPA from booting and re-fetching everything.
-        mainModule.remove()
 
+        // Nothing from the page itself is needed — only its origin, so that the api
+        // call is same-origin and carries the site's cookies. Handing the WebView an
+        // empty document instead of the real one means no stylesheets, fonts,
+        // preloads, images or third-party scripts are fetched, and the site's own
+        // bundle never runs: the injected script is the only thing on the page.
         val response = evaluateWebViewApiJson(
             pageUrl = titleUrl,
             script = chapterScript(hashId.toJsString(), mainScriptUrl.toJsString()),
             timeoutMs = CHAPTER_WEBVIEW_TIMEOUT,
-            html = document.outerHtml(),
+            html = BLANK_SHELL_HTML,
         )
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
@@ -1012,6 +1019,7 @@ internal class Comix(context: MangaLoaderContext) :
 
         private const val CAUSE_CHAIN_LIMIT = 8
         private const val MAIN_MODULE_SELECTOR = "script[type=module][src*=/dist/main-]"
+        private const val BLANK_SHELL_HTML = "<!doctype html><html><head></head><body></body></html>"
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
