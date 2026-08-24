@@ -850,15 +850,15 @@ internal class Comix(context: MangaLoaderContext) :
     private fun isCloudflarePage(html: String): Boolean {
         if (html.isBlank()) return false
         val lower = html.lowercase(Locale.US)
-        return lower.contains("<title>just a moment") ||
-            ((lower.contains("just a moment") || lower.contains("checking your browser")) && lower.contains("cloudflare")) ||
-            lower.contains("cf-browser-verification") ||
+        return lower.contains("cf-browser-verification") ||
             lower.contains("cf-chl-opt") ||
+            lower.contains("window._cf_chl_opt") ||
+            lower.contains("__cf_chl") ||
             lower.contains("challenge-platform") ||
             lower.contains("challenges.cloudflare.com") ||
             lower.contains("cf-turnstile") ||
-            lower.contains("turnstile") ||
-            lower.contains("we're maintaining the site")
+            lower.contains("challenge-error-title") ||
+            lower.contains("challenge-error-text")
     }
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
@@ -1034,15 +1034,12 @@ internal class Comix(context: MangaLoaderContext) :
         private const val CLOUDFLARE_DETECT_JS = """
                 const isCloudflareChallenge = () => {
                     try {
-                        const title = (document.title || '').toLowerCase();
-                        if (title.indexOf('just a moment') !== -1) return true;
-                        if (title.indexOf('attention required') !== -1) return true;
-                        if (title.indexOf('checking your browser') !== -1) return true;
                         return !!document.querySelector(
-                            '#challenge-form, #challenge-running, #challenge-error-title, ' +
+                            '#challenge-form, #challenge-running, #challenge-error-title, #challenge-error-text, ' +
                             '#cf-challenge-running, .cf-browser-verification, .cf-turnstile, ' +
-                            'script[src*="challenge-platform"], ' +
-                            'iframe[src*="challenges.cloudflare.com"]'
+                            'form[action*="__cf_chl"], input[name="cf-turnstile-response"], ' +
+                            'script[src*="challenge-platform"], script[src*="turnstile"], ' +
+                            '[src*="challenges.cloudflare.com"]'
                         );
                     } catch (e) {
                         return false;
@@ -1067,7 +1064,7 @@ internal class Comix(context: MangaLoaderContext) :
         private fun chapterScript(mangaId: String, knownEnvUrl: String) = """
             (async () => {
 $CLOUDFLARE_DETECT_JS
-                if (isCloudflareChallenge()) return null;
+                if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
 
                 const MANGA_ID = $mangaId;
                 // Reused from an earlier load when we have it: resolving it means
@@ -1236,7 +1233,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
-                if (isCloudflareChallenge()) return null;
+                if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1277,7 +1274,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
-                    if (isCloudflareChallenge()) return null;
+                    if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {
@@ -1301,7 +1298,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
-                if (isCloudflareChallenge()) return null;
+                if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1342,7 +1339,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
-                    if (isCloudflareChallenge()) return null;
+                    if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {
