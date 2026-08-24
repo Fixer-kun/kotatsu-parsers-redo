@@ -179,12 +179,24 @@ internal class Comix(context: MangaLoaderContext) :
      * GET is tried first for the rare route that does inline `script#initial-data`.
      */
     private suspend fun loadBrowseItems(browseUrl: String): JSONArray {
+        var sawCloudflare = false
         runCatching { webClient.httpGet(browseUrl).parseHtml() }
+            .onFailure { sawCloudflare = it.isCloudFlareProtection() }
             .getOrNull()
             ?.let { extractInitialDataItems(it) }
             ?.let { return it }
 
-        val response = evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
+        // The direct request was turned away by the challenge and the WebView could
+        // not get past it either, so ask for it to be solved rather than reporting
+        // an empty listing.
+        val response = try {
+            evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
+        } catch (e: Exception) {
+            if (sawCloudflare || e.isCloudFlareProtection()) {
+                requestCloudflareVerification(browseUrl, e)
+            }
+            throw e
+        }
         return response.optJSONObject("result")?.optJSONArray("items")
             ?: response.optJSONArray("items")
             ?: throw ParseException("Comix browse page returned no results", browseUrl)
@@ -199,16 +211,27 @@ internal class Comix(context: MangaLoaderContext) :
      * we need (vs. a challenge/empty shell), so we keep retrying until it does.
      */
     private suspend fun loadRenderedDocument(url: String, isReady: (Document) -> Boolean): Document? {
+        var sawCloudflare = false
         repeat(WEBVIEW_PAGE_ATTEMPTS) {
             runCatching { webClient.httpGet(url).parseHtml() }
+                .onFailure { if (it.isCloudFlareProtection()) sawCloudflare = true }
                 .getOrNull()
                 ?.takeIf(isReady)
                 ?.let { return it }
 
             val html = context.evaluateJs(url, PAGE_HTML_SCRIPT, WEBVIEW_PAGE_TIMEOUT)
             if (!html.isNullOrBlank()) {
-                Jsoup.parse(html, url).takeIf(isReady)?.let { return it }
+                if (html == CLOUDFLARE_BLOCKED || isCloudflarePage(html)) {
+                    sawCloudflare = true
+                } else {
+                    Jsoup.parse(html, url).takeIf(isReady)?.let { return it }
+                }
             }
+        }
+        // Every attempt came back as a challenge rather than the page, so this is
+        // not a title we failed to parse — it is one we were never shown.
+        if (sawCloudflare) {
+            requestCloudflareVerification(url)
         }
         return null
     }
@@ -306,10 +329,19 @@ internal class Comix(context: MangaLoaderContext) :
 
         // Capture the reader page's own (signed, decrypted) page payload rather
         // than re-implementing the request signing, which hangs (see [loadAllChapters]).
+        var sawCloudflare = false
         val response = runCatching { webClient.httpGet(readerUrl).parseHtml() }
+            .onFailure { sawCloudflare = it.isCloudFlareProtection() }
             .getOrNull()
             ?.let { extractInitialDataPages(it) }
-            ?: evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
+            ?: try {
+                evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
+            } catch (e: Exception) {
+                if (sawCloudflare || e.isCloudFlareProtection()) {
+                    requestCloudflareVerification(readerUrl, e)
+                }
+                throw e
+            }
         val pagesRoot = response.optJSONObject("result")?.optJSONObject("pages")
         val baseUrl = pagesRoot?.optString("baseUrl").orEmpty().trimEnd('/')
         val pages = pagesRoot?.optJSONArray("items")
@@ -667,7 +699,7 @@ internal class Comix(context: MangaLoaderContext) :
         // it for us. [CHAPTER_SCRIPT] scrapes the rendered list and walks the
         // pager, which is why it doesn't matter that our hooks are installed only
         // after the first request has already been made and parsed.
-        val response = evaluateWebViewApiJson(titleUrl, CHAPTER_SCRIPT, CHAPTER_WEBVIEW_TIMEOUT)
+        val response = evaluateWebViewApiJson(titleUrl, chapterScript(hashId.toJsString()), CHAPTER_WEBVIEW_TIMEOUT)
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
         // `empty` means the page rendered its "No chapters match." state, i.e. the
@@ -773,6 +805,24 @@ internal class Comix(context: MangaLoaderContext) :
             .replace("\n", "\\n")
             .replace("\r", "\\r")
             .replace("\t", "\\t") + "\""
+    }
+
+    /**
+     * The app raises its own Cloudflare exception from a module this library cannot
+     * reference by type, so it is recognised by name instead. Without this the plain
+     * first-pass GET swallows the challenge and the failure surfaces later as an
+     * unrelated parse error.
+     */
+    private fun Throwable.isCloudFlareProtection(): Boolean {
+        var error: Throwable? = this
+        var depth = 0
+        while (error != null && depth < CAUSE_CHAIN_LIMIT) {
+            if (error.javaClass.simpleName.contains("CloudFlare", ignoreCase = true)) return true
+            if (error.message?.contains("cloudflare", ignoreCase = true) == true) return true
+            error = error.cause
+            depth++
+        }
+        return false
     }
 
     private fun isCloudflarePage(html: String): Boolean {
@@ -920,6 +970,14 @@ internal class Comix(context: MangaLoaderContext) :
         // list has stalled and returning what it already has.
         private const val CHAPTER_STALL_MS = 45000
 
+        // Ceiling for the API fast path: 100 chapters a call, so this is far beyond
+        // any real series and only guards against a pager that never reports its end.
+        private const val MAX_CHAPTER_API_PAGES = 200
+
+        // How long the fast path waits for the page's main module to appear before
+        // giving up on it and falling back to walking the rendered pager.
+        private const val BUNDLE_WAIT_MS = 20000
+
         // Below this, a timestamp is seconds rather than milliseconds
         // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
         private const val SECONDS_TIMESTAMP_LIMIT = 10_000_000_000L
@@ -930,8 +988,46 @@ internal class Comix(context: MangaLoaderContext) :
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
 
+        private const val CAUSE_CHAIN_LIMIT = 8
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
+
+        // A challenge that is going to clear on its own does so within a few
+        // seconds; past this it needs the user, so we stop waiting and say so.
+        private const val CLOUDFLARE_GRACE_MS = 12000
+
+        // Recognises the Cloudflare interstitial from inside the page. Without this
+        // the capture scripts just poll a challenge screen until their timeout and
+        // report "no data captured", which is why a first, uncleared visit looked
+        // like a parse failure instead of asking the user to solve it.
+        // [evaluateWebViewApiJson] turns the sentinel into a browser-action prompt.
+        private const val CLOUDFLARE_DETECT_JS = """
+                const isCloudflareChallenge = () => {
+                    try {
+                        const title = (document.title || '').toLowerCase();
+                        if (title.indexOf('just a moment') !== -1) return true;
+                        if (title.indexOf('attention required') !== -1) return true;
+                        if (title.indexOf('checking your browser') !== -1) return true;
+                        return !!document.querySelector(
+                            '#challenge-form, #challenge-running, #challenge-error-title, ' +
+                            '#cf-challenge-running, .cf-browser-verification, .cf-turnstile, ' +
+                            'script[src*="challenge-platform"], ' +
+                            'iframe[src*="challenges.cloudflare.com"]'
+                        );
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                let cloudflareSince = 0;
+                const cloudflareBlocking = () => {
+                    if (!isCloudflareChallenge()) {
+                        cloudflareSince = 0;
+                        return false;
+                    }
+                    if (cloudflareSince === 0) cloudflareSince = Date.now();
+                    return Date.now() - cloudflareSince >= $CLOUDFLARE_GRACE_MS;
+                };
+        """
 
         // Collects the whole chapter list off the title page.
         //
@@ -953,9 +1049,14 @@ internal class Comix(context: MangaLoaderContext) :
         //   groups  [{ id?, name?, o }] — o = 1 when the group's release is official
         //   items   [{ i: id, n: number, u: url suffix, g: group index,
         //              v: volume?, t: name?, c: epoch seconds?, d: relative date? }]
-        private val CHAPTER_SCRIPT = """
+        private fun chapterScript(mangaId: String) = """
             (async () => {
+                const MANGA_ID = $mangaId;
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+$CLOUDFLARE_DETECT_JS
+                // Nothing below can work behind a challenge, so settle that first.
+                while (isCloudflareChallenge() && !cloudflareBlocking()) await sleep(250);
+                if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                 // A page turn is quick; only the initial render gets the full
                 // stall allowance.
                 const CLICK_TIMEOUT = 15000;
@@ -1045,6 +1146,71 @@ internal class Comix(context: MangaLoaderContext) :
                         try { takePayload(original(this.responseText)); } catch (e) {}
                     });
                     return originalSend.apply(this, arguments);
+                };
+
+                // --- Fast path: call the site's own chapter API directly. ---
+                //
+                // The signing key lives in a lazily imported `env-*.js` bundle that the
+                // main module references; importing it hands us the same api object the
+                // page uses, so `chapters()` signs and decrypts for us. One call returns
+                // 100 chapters, against the 20 a rendered page shows — and with no DOM to
+                // wait on, which is what the pager walk below spends nearly all its time
+                // doing. It stays as the fallback for when the bundle layout changes.
+                const fetchViaApi = async () => {
+                    try {
+                        const found = await waitFor(
+                            () => !!document.querySelector('script[type=module][src*="/dist/main-"]'),
+                            $BUNDLE_WAIT_MS,
+                        );
+                        if (!found) return null;
+                        const mainScriptUrl = document
+                            .querySelector('script[type=module][src*="/dist/main-"]').src;
+                        if (!mainScriptUrl) return null;
+
+                        const mainResponse = await fetch(mainScriptUrl);
+                        if (!mainResponse.ok) return null;
+                        const mainJavaScript = await mainResponse.text();
+                        const environmentFile = mainJavaScript.match(
+                            /from\s*["']\.\/(env-[^"']+\.js)["']/
+                        );
+                        if (!environmentFile) return null;
+
+                        // A bare `import()` in an injected script is parsed in the wrong
+                        // context; going through Function keeps it a real dynamic import.
+                        const importBundle = new Function('url', 'return import(url)');
+                        const environment = await importBundle(
+                            new URL(environmentFile[1], mainScriptUrl).href
+                        );
+                        const mangaApi = Object.values(environment).find((value) =>
+                            value && typeof value === 'object' && typeof value.chapters === 'function'
+                        );
+                        if (!mangaApi) return null;
+
+                        let page = 1;
+                        let received = 0;
+                        while (page <= $MAX_CHAPTER_API_PAGES) {
+                            const response = await mangaApi.chapters(MANGA_ID, {
+                                page: page,
+                                limit: 100,
+                                order: { number: 'desc' }
+                            });
+                            const items = response && (response.items ||
+                                (response.result && response.result.items));
+                            if (!Array.isArray(items)) return received > 0 ? 'ok' : null;
+                            if (items.length === 0) break;
+                            takePayload({ items: items });
+                            received += items.length;
+                            const meta = response.meta || response.pagination || {};
+                            const lastPage = meta.lastPage || meta.last_page || page;
+                            if (!(meta.hasNext || page < lastPage)) break;
+                            page++;
+                        }
+                        // Zero rows from a working API means the title really has none;
+                        // a thrown/absent api means we learned nothing and must fall back.
+                        return received > 0 ? 'ok' : 'empty';
+                    } catch (e) {
+                        return null;
+                    }
                 };
 
                 // --- The rendered list: always available, whatever our timing. ---
@@ -1182,27 +1348,8 @@ internal class Comix(context: MangaLoaderContext) :
                     }
                 };
 
-                await waitFor(() => hasRows() || isEmptyState());
-                await settle();
-                scrape();
-                await walk();
-
-                // The site reports how many chapters exist, so a short result
-                // means a click never landed and a whole page was skipped.
-                // Rewinding and walking once more recovers it.
-                const expected = total();
-                if (expected > 0 && byId.size < expected) {
-                    const first = firstButton();
-                    if (first) {
-                        first.click();
-                        await waitFor(() => /Showing\s+1\s+to/i.test(hint()));
-                        await settle();
-                        scrape();
-                        await walk();
-                    }
-                }
-
                 // --- Compact the result for the fragment-URL trip back. ---
+                const compact = (isEmpty) => {
                 const collected = [...byId.values()];
                 let prefix = collected.length ? String(collected[0].url || '') : '';
                 for (const chapter of collected) {
@@ -1244,8 +1391,35 @@ internal class Comix(context: MangaLoaderContext) :
                     prefix: prefix,
                     groups: groups,
                     items: items,
-                    empty: items.length === 0 && isEmptyState()
+                    empty: items.length === 0 && isEmpty
                 });
+                };
+
+                const apiResult = await fetchViaApi();
+                if (apiResult) return compact(apiResult === 'empty');
+
+                // --- Fallback: read the rendered list and click through the pager. ---
+                await waitFor(() => hasRows() || isEmptyState());
+                await settle();
+                scrape();
+                await walk();
+
+                // The site reports how many chapters exist, so a short result
+                // means a click never landed and a whole page was skipped.
+                // Rewinding and walking once more recovers it.
+                const expected = total();
+                if (expected > 0 && byId.size < expected) {
+                    const first = firstButton();
+                    if (first) {
+                        first.click();
+                        await waitFor(() => /Showing\s+1\s+to/i.test(hint()));
+                        await settle();
+                        scrape();
+                        await walk();
+                    }
+                }
+
+                return compact(isEmptyState());
             })()
         """
 
@@ -1257,6 +1431,7 @@ internal class Comix(context: MangaLoaderContext) :
         private const val BROWSE_CAPTURE_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+$CLOUDFLARE_DETECT_JS
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1297,6 +1472,7 @@ internal class Comix(context: MangaLoaderContext) :
                 };
                 for (let i = 0; i < 200; i++) {
                     if (captured) return captured;
+                    if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {
@@ -1319,6 +1495,7 @@ internal class Comix(context: MangaLoaderContext) :
         private const val PAGE_CAPTURE_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+$CLOUDFLARE_DETECT_JS
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1359,6 +1536,7 @@ internal class Comix(context: MangaLoaderContext) :
                 };
                 for (let i = 0; i < 200; i++) {
                     if (captured) return captured;
+                    if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {

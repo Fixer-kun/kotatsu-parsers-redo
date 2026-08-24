@@ -284,8 +284,10 @@ internal class DesuMeParser(context: MangaLoaderContext) :
         val MANGA_ID_REGEX = Regex("""\.(\d+)/?$""")
         val LEGACY_MANGA_URL_REGEX = Regex("""/manga/api/(\d+)/?$""")
         const val READER_CONFIG_KEY = "window.MangaReader"
+        // Both braces must be escaped: Android's ICU engine rejects a bare `}` as a
+        // syntax error, even though the JVM accepts it.
         val READER_CONFIG_REGEX = Regex(
-            """window\.MangaReader\s*=\s*(\{.*?})\s*;""",
+            """window\.MangaReader\s*=\s*(\{.*?\})\s*;""",
             RegexOption.DOT_MATCHES_ALL,
         )
     }
