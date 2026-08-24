@@ -992,9 +992,22 @@ internal class Comix(context: MangaLoaderContext) :
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
 
-        // A challenge that is going to clear on its own does so within a few
-        // seconds; past this it needs the user, so we stop waiting and say so.
-        private const val CLOUDFLARE_GRACE_MS = 12000
+        // An auto-solving challenge clears in a couple of seconds, so this is all the
+        // benefit of the doubt one gets before we assume it needs the user. It is a
+        // ceiling, not a wait: the scripts poll and move on the moment it clears.
+        private const val CLOUDFLARE_GRACE_MS = 4000
+
+        // One Cloudflare has already put in front of a human — the same markers
+        // CloudFlareHelper treats as a captcha — is never going to clear by itself,
+        // so it is reported almost at once instead of sitting out the grace period.
+        private const val CLOUDFLARE_INTERACTIVE_GRACE_MS = 800
+
+        // How often the challenge state is re-checked. Short, so that clearing the
+        // challenge resumes the work practically immediately.
+        private const val CLOUDFLARE_POLL_MS = 100
+
+        // Concurrent chapter-list requests once the page count is known.
+        private const val CHAPTER_API_CONCURRENCY = 6
 
         // Recognises the Cloudflare interstitial from inside the page. Without this
         // the capture scripts just poll a challenge screen until their timeout and
@@ -1018,6 +1031,18 @@ internal class Comix(context: MangaLoaderContext) :
                         return false;
                     }
                 };
+                // Cloudflare's own "verify you are human" state, which is waiting on a
+                // person and will not resolve however long we sit here.
+                const cloudflareNeedsUser = () => {
+                    try {
+                        return !!document.querySelector(
+                            '#challenge-error-title, #challenge-error-text, ' +
+                            '#challenge-stage input[type="checkbox"]'
+                        );
+                    } catch (e) {
+                        return false;
+                    }
+                };
                 let cloudflareSince = 0;
                 const cloudflareBlocking = () => {
                     if (!isCloudflareChallenge()) {
@@ -1025,7 +1050,10 @@ internal class Comix(context: MangaLoaderContext) :
                         return false;
                     }
                     if (cloudflareSince === 0) cloudflareSince = Date.now();
-                    return Date.now() - cloudflareSince >= $CLOUDFLARE_GRACE_MS;
+                    const grace = cloudflareNeedsUser()
+                        ? $CLOUDFLARE_INTERACTIVE_GRACE_MS
+                        : $CLOUDFLARE_GRACE_MS;
+                    return Date.now() - cloudflareSince >= grace;
                 };
         """
 
@@ -1055,7 +1083,9 @@ internal class Comix(context: MangaLoaderContext) :
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
                 // Nothing below can work behind a challenge, so settle that first.
-                while (isCloudflareChallenge() && !cloudflareBlocking()) await sleep(250);
+                while (isCloudflareChallenge() && !cloudflareBlocking()) {
+                    await sleep($CLOUDFLARE_POLL_MS);
+                }
                 if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                 // A page turn is quick; only the initial render gets the full
                 // stall allowance.
@@ -1186,28 +1216,60 @@ $CLOUDFLARE_DETECT_JS
                         );
                         if (!mangaApi) return null;
 
-                        let page = 1;
-                        let received = 0;
-                        while (page <= $MAX_CHAPTER_API_PAGES) {
-                            const response = await mangaApi.chapters(MANGA_ID, {
-                                page: page,
-                                limit: 100,
-                                order: { number: 'desc' }
-                            });
-                            const items = response && (response.items ||
-                                (response.result && response.result.items));
-                            if (!Array.isArray(items)) return received > 0 ? 'ok' : null;
-                            if (items.length === 0) break;
-                            takePayload({ items: items });
-                            received += items.length;
-                            const meta = response.meta || response.pagination || {};
-                            const lastPage = meta.lastPage || meta.last_page || page;
-                            if (!(meta.hasNext || page < lastPage)) break;
-                            page++;
+                        const askFor = (page) => mangaApi.chapters(MANGA_ID, {
+                            page: page,
+                            limit: 100,
+                            order: { number: 'desc' }
+                        });
+                        const rowsOf = (response) => response && (response.items ||
+                            (response.result && response.result.items));
+
+                        const first = await askFor(1);
+                        const firstItems = rowsOf(first);
+                        if (!Array.isArray(firstItems)) return null;
+                        if (firstItems.length === 0) return 'empty';
+                        takePayload({ items: firstItems });
+
+                        // The first response reports how many pages there are, so the
+                        // rest do not have to be discovered one at a time — they go out
+                        // together and the whole list arrives in two round trips instead
+                        // of one per hundred chapters.
+                        const meta = first.meta || first.pagination || {};
+                        const lastPage = Math.min(
+                            meta.lastPage || meta.last_page || 1,
+                            $MAX_CHAPTER_API_PAGES,
+                        );
+
+                        if (lastPage > 1) {
+                            let nextPage = 2;
+                            const worker = async () => {
+                                for (;;) {
+                                    const page = nextPage++;
+                                    if (page > lastPage) return;
+                                    const items = rowsOf(await askFor(page));
+                                    if (Array.isArray(items) && items.length > 0) {
+                                        takePayload({ items: items });
+                                    }
+                                }
+                            };
+                            const workers = Math.min($CHAPTER_API_CONCURRENCY, lastPage - 1);
+                            await Promise.all(Array.from({ length: workers }, worker));
+                        } else if (meta.hasNext) {
+                            // No page count to fan out over, so walk it the slow way.
+                            let page = 2;
+                            while (page <= $MAX_CHAPTER_API_PAGES) {
+                                const response = await askFor(page);
+                                const items = rowsOf(response);
+                                if (!Array.isArray(items) || items.length === 0) break;
+                                takePayload({ items: items });
+                                const pageMeta = response.meta || response.pagination || {};
+                                if (!pageMeta.hasNext) break;
+                                page++;
+                            }
                         }
                         // Zero rows from a working API means the title really has none;
                         // a thrown/absent api means we learned nothing and must fall back.
-                        return received > 0 ? 'ok' : 'empty';
+                        return byId.size > 0 ? 'ok' : 'empty';
                     } catch (e) {
                         return null;
                     }
@@ -1470,7 +1532,7 @@ $CLOUDFLARE_DETECT_JS
                     });
                     return originalSend.apply(this, arguments);
                 };
-                for (let i = 0; i < 200; i++) {
+                for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
                     if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                     try {
@@ -1484,7 +1546,7 @@ $CLOUDFLARE_DETECT_JS
                             }
                         }
                     } catch (e) {}
-                    await sleep(150);
+                    await sleep($CLOUDFLARE_POLL_MS);
                 }
                 return JSON.stringify({ error: 'no browse data captured' });
             })()
@@ -1534,7 +1596,7 @@ $CLOUDFLARE_DETECT_JS
                     });
                     return originalSend.apply(this, arguments);
                 };
-                for (let i = 0; i < 200; i++) {
+                for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
                     if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
                     try {
@@ -1546,7 +1608,7 @@ $CLOUDFLARE_DETECT_JS
                             }
                         }
                     } catch (e) {}
-                    await sleep(150);
+                    await sleep($CLOUDFLARE_POLL_MS);
                 }
                 return JSON.stringify({ error: 'no page data captured' });
             })()
