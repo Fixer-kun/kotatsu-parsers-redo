@@ -738,42 +738,59 @@ internal class Comix(context: MangaLoaderContext) :
         timeoutMs: Long = WEBVIEW_API_TIMEOUT,
     ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
-        val requests = runCatching {
-            context.interceptWebViewRequests(
-                pageUrl,
-                InterceptionConfig(
-                    timeoutMs = timeoutMs,
-                    maxRequests = 1,
-                    urlPattern = INTERCEPT_URL_REGEX,
-                    pageScript = bridgeScript,
-                ),
-            )
-        }.getOrElse { e ->
-            throw ParseException("Comix WebView API interception failed", pageUrl, e)
-        }
-        val resultUrl = requests.firstOrNull()?.url
-            ?: throw ParseException("Comix WebView API did not return a bridge result", pageUrl)
-        val decoded = when {
-            resultUrl.contains("/error", ignoreCase = true) -> {
-                val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
-                throw ParseException("Comix WebView API failed: $message", pageUrl)
+        repeat(WEBVIEW_NAVIGATION_ATTEMPTS) { attempt ->
+            val navigationUrl = if (attempt == 0) pageUrl else pageUrl.withWebViewCacheBuster()
+            val requests = runCatching {
+                context.interceptWebViewRequests(
+                    navigationUrl,
+                    InterceptionConfig(
+                        timeoutMs = timeoutMs,
+                        maxRequests = 1,
+                        urlPattern = INTERCEPT_URL_REGEX,
+                        pageScript = bridgeScript,
+                    ),
+                )
+            }.getOrElse { e ->
+                throw ParseException("Comix WebView API interception failed", pageUrl, e)
             }
-            else -> resultUrl.queryParameterValue("data")
-                ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
+            val resultUrl = requests.firstOrNull()?.url
+                ?: throw ParseException("Comix WebView API did not return a bridge result", pageUrl)
+            val decoded = when {
+                resultUrl.contains("/error", ignoreCase = true) -> {
+                    val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
+                    throw ParseException("Comix WebView API failed: $message", pageUrl)
+                }
+                else -> resultUrl.queryParameterValue("data")
+                    ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
+            }
+            if (decoded == WEBVIEW_LOAD_FAILED) {
+                if (attempt + 1 < WEBVIEW_NAVIGATION_ATTEMPTS) return@repeat
+                requestWebViewRecovery(pageUrl)
+            }
+            if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
+                requestCloudflareVerification(pageUrl)
+            }
+            if (decoded.isBlank()) {
+                throw ParseException("Comix WebView API returned an empty response", pageUrl)
+            }
+            val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
+                throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
+            }
+            json.optString("error").nullIfEmpty()?.let { error ->
+                throw ParseException("Comix WebView API failed: $error", pageUrl)
+            }
+            return json
         }
-        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            requestCloudflareVerification(pageUrl)
-        }
-        if (decoded.isBlank()) {
-            throw ParseException("Comix WebView API returned an empty response", pageUrl)
-        }
-        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
-            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", pageUrl, e)
-        }
-        json.optString("error").nullIfEmpty()?.let { error ->
-            throw ParseException("Comix WebView API failed: $error", pageUrl)
-        }
-        return json
+        throw ParseException("Comix WebView API could not load the page", pageUrl)
+    }
+
+    private fun String.withWebViewCacheBuster(): String {
+        return toHttpUrlOrNull()?.newBuilder()
+            ?.removeAllQueryParameters(WEBVIEW_CACHE_BUSTER_PARAM)
+            ?.addQueryParameter(WEBVIEW_CACHE_BUSTER_PARAM, System.currentTimeMillis().toString())
+            ?.build()
+            ?.toString()
+            ?: this
     }
 
     private fun buildWebViewApiBridgeScript(script: String): String {
@@ -828,6 +845,14 @@ internal class Comix(context: MangaLoaderContext) :
             context.requestBrowserAction(this, url)
         } catch (e: UnsupportedOperationException) {
             throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
+        }
+    }
+
+    private fun requestWebViewRecovery(url: String): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(WEBVIEW_LOAD_MESSAGE, url, e)
         }
     }
 
@@ -1008,11 +1033,16 @@ internal class Comix(context: MangaLoaderContext) :
         // (2286-11-20 in seconds, 1973-03-03 in milliseconds).
         private const val SECONDS_TIMESTAMP_LIMIT = 10_000_000_000L
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
+        private const val WEBVIEW_LOAD_FAILED = "WEBVIEW_LOAD_FAILED"
         private const val INTERCEPT_RESULT_URL = "https://kotatsu.intercept/result"
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
         private const val CLOUDFLARE_MESSAGE =
             "Comix could not get past the Cloudflare check. Try again in a moment."
+        private const val WEBVIEW_LOAD_MESSAGE =
+            "Comix could not load the page in WebView. Open it in the browser and try again."
+        private const val WEBVIEW_CACHE_BUSTER_PARAM = "_kotatsu_retry"
+        private const val WEBVIEW_NAVIGATION_ATTEMPTS = 2
 
         private const val CAUSE_CHAIN_LIMIT = 8
         private const val MAIN_MODULE_SELECTOR = "script[type=module][src*=/dist/main-]"
@@ -1026,11 +1056,10 @@ internal class Comix(context: MangaLoaderContext) :
         // Concurrent chapter-list requests once the page count is known.
         private const val CHAPTER_API_CONCURRENCY = 6
 
-        // Recognises the Cloudflare interstitial from inside the page. Without this
-        // the capture scripts just poll a challenge screen until their timeout and
-        // report "no data captured", which is why a first, uncleared visit looked
-        // like a parse failure instead of asking the user to solve it.
-        // [evaluateWebViewApiJson] turns the sentinel into a browser-action prompt.
+        // Recognises blocking documents from stable DOM markers rather than their
+        // localised titles. [evaluateWebViewApiJson] turns a Cloudflare result into
+        // a browser prompt; a Chromium network-error result gets one cache-busted
+        // retry first because a fresh WebView can fail its initial navigation.
         private const val CLOUDFLARE_DETECT_JS = """
                 const isCloudflareChallenge = () => {
                     try {
@@ -1040,6 +1069,16 @@ internal class Comix(context: MangaLoaderContext) :
                             'form[action*="__cf_chl"], input[name="cf-turnstile-response"], ' +
                             'script[src*="challenge-platform"], script[src*="turnstile"], ' +
                             '[src*="challenges.cloudflare.com"]'
+                        );
+                    } catch (e) {
+                        return false;
+                    }
+                };
+                const isWebViewLoadError = () => {
+                    try {
+                        const uri = String(document.documentURI || '');
+                        return uri.indexOf('chrome-error://') === 0 || !!document.querySelector(
+                            '#main-frame-error, #error-information-popup-container, body.neterror'
                         );
                     } catch (e) {
                         return false;
@@ -1064,6 +1103,7 @@ internal class Comix(context: MangaLoaderContext) :
         private fun chapterScript(mangaId: String, knownEnvUrl: String) = """
             (async () => {
 $CLOUDFLARE_DETECT_JS
+                if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
 
                 const MANGA_ID = $mangaId;
@@ -1083,6 +1123,8 @@ $CLOUDFLARE_DETECT_JS
                         // for the document to be parsed.
                         let mainScript = null;
                         for (let i = 0; i < $BUNDLE_WAIT_TICKS; i++) {
+                            if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
+                            if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                             mainScript = document.querySelector($MAIN_MODULE_SELECTOR_JS);
                             if (mainScript && mainScript.src) break;
                             await sleep(100);
@@ -1233,6 +1275,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
+                if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                 const original = JSON.parse;
                 let captured = null;
@@ -1274,6 +1317,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
+                    if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                     if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
@@ -1298,6 +1342,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
+                if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                 const original = JSON.parse;
                 let captured = null;
@@ -1339,6 +1384,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
+                    if (isWebViewLoadError()) return '$WEBVIEW_LOAD_FAILED';
                     if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                     try {
                         const node = document.querySelector('script#initial-data');
