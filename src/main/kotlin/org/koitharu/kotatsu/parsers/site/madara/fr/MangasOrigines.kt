@@ -75,16 +75,25 @@ internal class MangasOrigines(context: MangaLoaderContext) :
 			"No image found, try to log in",
 			fullUrl,
 		)
-		return root.select(selectPage).flatMap { div ->
-			div.selectOrThrow("img").map { img ->
-				val url = img.attr("src").trim().toRelativeUrl(domain)
-				MangaPage(
-					id = generateUid(url),
-					url = url,
-					preview = null,
-					source = source,
-				)
+		val urls = root.select(selectPage).flatMap { div ->
+			div.select("img").mapNotNull { img ->
+				img.src(pageImageAttributes)
+					?.trim()
+					?.takeIf { it.isNotEmpty() }
+					?.toRelativeUrl(domain)
 			}
+		}
+			.distinct()
+		if (urls.isEmpty()) {
+			throw ParseException("No chapter images found", fullUrl)
+		}
+		return urls.map { url ->
+			MangaPage(
+				id = generateUid(url),
+				url = url,
+				preview = null,
+				source = source,
+			)
 		}
 	}
 
@@ -132,5 +141,18 @@ internal class MangasOrigines(context: MangaLoaderContext) :
 				source = source,
 			)
 		}
+	}
+
+	private companion object {
+		private val pageImageAttributes = arrayOf(
+			"data-src",
+			"data-cfsrc",
+			"data-original",
+			"data-cdn",
+			"data-lazy-src",
+			"original-src",
+			"data-wpfc-original-src",
+			"src",
+		)
 	}
 }
