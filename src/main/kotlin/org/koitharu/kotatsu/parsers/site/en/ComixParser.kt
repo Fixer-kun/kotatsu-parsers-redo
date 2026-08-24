@@ -186,14 +186,11 @@ internal class Comix(context: MangaLoaderContext) :
             ?.let { extractInitialDataItems(it) }
             ?.let { return it }
 
-        // The direct request was turned away by the challenge and the WebView could
-        // not get past it either, so ask for it to be solved rather than reporting
-        // an empty listing.
         val response = try {
             evaluateWebViewApiJson(browseUrl, BROWSE_CAPTURE_SCRIPT)
         } catch (e: Exception) {
             if (sawCloudflare || e.isCloudFlareProtection()) {
-                requestCloudflareVerification(browseUrl, e)
+                throw ParseException(CLOUDFLARE_MESSAGE, browseUrl, e)
             }
             throw e
         }
@@ -228,10 +225,10 @@ internal class Comix(context: MangaLoaderContext) :
                 }
             }
         }
-        // Every attempt came back as a challenge rather than the page, so this is
-        // not a title we failed to parse — it is one we were never shown.
+        // Every attempt came back as a challenge rather than the page. The caller
+        // falls back to what it already knows rather than interrupting the user.
         if (sawCloudflare) {
-            requestCloudflareVerification(url)
+            return null
         }
         return null
     }
@@ -338,7 +335,7 @@ internal class Comix(context: MangaLoaderContext) :
                 evaluateWebViewApiJson(readerUrl, PAGE_CAPTURE_SCRIPT)
             } catch (e: Exception) {
                 if (sawCloudflare || e.isCloudFlareProtection()) {
-                    requestCloudflareVerification(readerUrl, e)
+                    throw ParseException(CLOUDFLARE_MESSAGE, readerUrl, e)
                 }
                 throw e
             }
@@ -691,19 +688,34 @@ internal class Comix(context: MangaLoaderContext) :
             ?: if (group?.optInt("o") == 1) "Official" else "Unknown"
     }
 
+    /**
+     * The title page ships no chapters in `script#initial-data` — the list comes over
+     * a signed XHR after hydration — so the page's own code has to make the call for
+     * us. It does not have to *run the site*, though: we fetch the page over HTTP,
+     * strip the module that boots the SPA, and hand the WebView that shell. Nothing
+     * renders, nothing is clicked; the script pulls the signing bundle the stripped
+     * module referenced and talks to the chapter API directly.
+     */
     private suspend fun loadAllChapters(hashId: String): JSONObject {
         val titleUrl = "https://$domain/title/$hashId"
 
-        // The title page ships no chapters in `script#initial-data` — the list is
-        // fetched over the signed XHR after hydration — so the page has to render
-        // it for us. [CHAPTER_SCRIPT] scrapes the rendered list and walks the
-        // pager, which is why it doesn't matter that our hooks are installed only
-        // after the first request has already been made and parsed.
-        val response = evaluateWebViewApiJson(titleUrl, chapterScript(hashId.toJsString()), CHAPTER_WEBVIEW_TIMEOUT)
+        val document = loadRenderedDocument(titleUrl) { it.selectFirst(MAIN_MODULE_SELECTOR) != null }
+            ?: throw ParseException("Comix title page did not load", titleUrl)
+        val mainModule = document.selectFirst(MAIN_MODULE_SELECTOR)
+            ?: throw ParseException("Comix main bundle not found", titleUrl)
+        val mainScriptUrl = mainModule.attrAsAbsoluteUrlOrNull("src")
+            ?: throw ParseException("Comix main bundle not found", titleUrl)
+        // Removing it is what keeps the SPA from booting and re-fetching everything.
+        mainModule.remove()
+
+        val response = evaluateWebViewApiJson(
+            pageUrl = titleUrl,
+            script = chapterScript(hashId.toJsString(), mainScriptUrl.toJsString()),
+            timeoutMs = CHAPTER_WEBVIEW_TIMEOUT,
+            html = document.outerHtml(),
+        )
         val items = response.optJSONArray("items")
             ?: throw ParseException("Comix chapter capture returned no items array", titleUrl)
-        // `empty` means the page rendered its "No chapters match." state, i.e. the
-        // title really has none — as opposed to us never seeing it render.
         if (items.length() == 0 && !response.optBoolean("empty")) {
             throw ParseException("Comix chapter list did not load", titleUrl)
         }
@@ -727,6 +739,7 @@ internal class Comix(context: MangaLoaderContext) :
         pageUrl: String,
         script: String,
         timeoutMs: Long = WEBVIEW_API_TIMEOUT,
+        html: String? = null,
     ): JSONObject {
         val bridgeScript = buildWebViewApiBridgeScript(script)
         val requests = runCatching {
@@ -737,6 +750,7 @@ internal class Comix(context: MangaLoaderContext) :
                     maxRequests = 1,
                     urlPattern = INTERCEPT_URL_REGEX,
                     pageScript = bridgeScript,
+                    html = html,
                 ),
             )
         }.getOrElse { e ->
@@ -753,7 +767,9 @@ internal class Comix(context: MangaLoaderContext) :
                 ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
         }
         if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
-            requestCloudflareVerification(pageUrl)
+            // The scripts bail out on a challenge instead of returning one, so this
+            // only happens when the WebView never got past it on its own.
+            throw ParseException(CLOUDFLARE_MESSAGE, pageUrl)
         }
         if (decoded.isBlank()) {
             throw ParseException("Comix WebView API returned an empty response", pageUrl)
@@ -768,24 +784,30 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     private fun buildWebViewApiBridgeScript(script: String): String {
+        // The script is injected on every navigation and polled while a page is up,
+        // so it can start many times over. One run at a time, and a run that has
+        // nothing yet (null) leaves without navigating so a later one can try again.
         return """
-            (async function() {
-                try {
-                    const result = await $script;
-                    window.location.href = "$INTERCEPT_RESULT_URL#data=" + encodeURIComponent(String(result || ""));
-                } catch (e) {
-                    window.location.href = "$INTERCEPT_ERROR_URL#msg=" + encodeURIComponent(String((e && e.message) || e));
-                }
+            (function() {
+                const state = '__comixBridgeState';
+                if (window[state]) return;
+                window[state] = true;
+                (async function() {
+                    try {
+                        const result = await $script;
+                        if (result === null || result === undefined || result === "") {
+                            window[state] = false;
+                            return;
+                        }
+                        window.location.href = "$INTERCEPT_RESULT_URL#data=" +
+                            encodeURIComponent(String(result));
+                    } catch (e) {
+                        window.location.href = "$INTERCEPT_ERROR_URL#msg=" +
+                            encodeURIComponent(String((e && e.message) || e));
+                    }
+                })();
             })();
         """.trimIndent()
-    }
-
-    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
-        try {
-            context.requestBrowserAction(this, url)
-        } catch (e: UnsupportedOperationException) {
-            throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
-        }
     }
 
     private fun String.queryParameterValue(name: String): String? {
@@ -986,25 +1008,12 @@ internal class Comix(context: MangaLoaderContext) :
         private const val INTERCEPT_ERROR_URL = "https://kotatsu.intercept/error"
         private val INTERCEPT_URL_REGEX = Regex("https://kotatsu\\.intercept/.*", RegexOption.IGNORE_CASE)
         private const val CLOUDFLARE_MESSAGE =
-            "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
+            "Comix could not get past the Cloudflare check. Try again in a moment."
 
         private const val CAUSE_CHAIN_LIMIT = 8
+        private const val MAIN_MODULE_SELECTOR = "script[type=module][src*=/dist/main-]"
         private const val WEBVIEW_PAGE_ATTEMPTS = 3
         private const val WEBVIEW_PAGE_TIMEOUT = 20000L
-
-        // An auto-solving challenge clears in a couple of seconds, so this is all the
-        // benefit of the doubt one gets before we assume it needs the user. It is a
-        // ceiling, not a wait: the scripts poll and move on the moment it clears.
-        private const val CLOUDFLARE_GRACE_MS = 4000
-
-        // One Cloudflare has already put in front of a human — the same markers
-        // CloudFlareHelper treats as a captcha — is never going to clear by itself,
-        // so it is reported almost at once instead of sitting out the grace period.
-        private const val CLOUDFLARE_INTERACTIVE_GRACE_MS = 800
-
-        // How often the challenge state is re-checked. Short, so that clearing the
-        // challenge resumes the work practically immediately.
-        private const val CLOUDFLARE_POLL_MS = 100
 
         // Concurrent chapter-list requests once the page count is known.
         private const val CHAPTER_API_CONCURRENCY = 6
@@ -1031,457 +1040,131 @@ internal class Comix(context: MangaLoaderContext) :
                         return false;
                     }
                 };
-                // Cloudflare's own "verify you are human" state, which is waiting on a
-                // person and will not resolve however long we sit here.
-                const cloudflareNeedsUser = () => {
-                    try {
-                        return !!document.querySelector(
-                            '#challenge-error-title, #challenge-error-text, ' +
-                            '#challenge-stage input[type="checkbox"]'
-                        );
-                    } catch (e) {
-                        return false;
-                    }
-                };
-                let cloudflareSince = 0;
-                const cloudflareBlocking = () => {
-                    if (!isCloudflareChallenge()) {
-                        cloudflareSince = 0;
-                        return false;
-                    }
-                    if (cloudflareSince === 0) cloudflareSince = Date.now();
-                    const grace = cloudflareNeedsUser()
-                        ? $CLOUDFLARE_INTERACTIVE_GRACE_MS
-                        : $CLOUDFLARE_GRACE_MS;
-                    return Date.now() - cloudflareSince >= grace;
-                };
         """
 
-        // Collects the whole chapter list off the title page.
+        // Collects the whole chapter list.
         //
-        // The script is injected once the page has finished loading, which is
-        // normally *after* the SPA has already fetched and parsed the first page
-        // of chapters — so hooking `JSON.parse`/`fetch`/XHR alone silently loses
-        // it. The rendered list is therefore the primary source (it is there no
-        // matter when we arrive) and the payload hooks only enrich the pages that
-        // are fetched later, while we walk the pager.
+        // Runs against the title page with the site's own module stripped out, so
+        // nothing renders and nothing is clicked. It pulls the signing bundle that
+        // module referenced, takes the api object out of it and asks the chapter
+        // endpoint directly, a hundred at a time.
         //
-        // There is no page or item limit: it keeps paging until the site says the
-        // list is complete, and only gives up if a page stops responding for
-        // [CHAPTER_STALL_MS].
-        //
-        // The result crosses back as a URL fragment, so it is emitted in a
-        // compact form — the shared URL prefix and the scanlation groups are sent
-        // once and referenced by index, and absent fields are omitted:
+        // The result crosses back as a URL fragment, so it is emitted in a compact
+        // form — the shared URL prefix and the scanlation groups are sent once and
+        // referenced by index, and absent fields are omitted:
         //   prefix  shared start of every chapter URL
         //   groups  [{ id?, name?, o }] — o = 1 when the group's release is official
         //   items   [{ i: id, n: number, u: url suffix, g: group index,
         //              v: volume?, t: name?, c: epoch seconds?, d: relative date? }]
-        private fun chapterScript(mangaId: String) = """
+        private fun chapterScript(mangaId: String, mainScriptUrl: String) = """
             (async () => {
-                const MANGA_ID = $mangaId;
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
-                // Nothing below can work behind a challenge, so settle that first.
-                while (isCloudflareChallenge() && !cloudflareBlocking()) {
-                    await sleep($CLOUDFLARE_POLL_MS);
-                }
-                if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
-                // A page turn is quick; only the initial render gets the full
-                // stall allowance.
-                const CLICK_TIMEOUT = 15000;
-                const byId = new Map();
-                const fromPayload = new Set();
+                if (isCloudflareChallenge()) return null;
 
-                // Waits for the page to do something, rather than against an
-                // overall budget: a long series may take as many pages as it
-                // takes, we only bail when nothing moves for a whole stall.
-                const waitFor = async (predicate, timeout) => {
-                    const until = Date.now() + (timeout || $CHAPTER_STALL_MS);
-                    while (Date.now() < until) {
-                        if (predicate()) return true;
-                        await sleep(100);
-                    }
-                    return false;
-                };
+                const MANGA_ID = $mangaId;
+                const MAIN_SCRIPT_URL = $mainScriptUrl;
+                // Kotatsu refreshes the whole list, so there is no known chapter to
+                // stop at; the field is kept so the loop matches the site's own.
+                const LATEST_CHAPTER_ID = null;
 
-                const text = (root, selector) => {
-                    const node = root.querySelector(selector);
-                    return node ? (node.textContent || '').trim() : '';
-                };
-                const number = (raw) => {
-                    const match = /(-?[0-9]+(?:\.[0-9]+)?)/.exec(String(raw || '').replace(/,/g, ''));
-                    return match ? Number(match[1]) : null;
-                };
-                const put = (chapter, isPayload) => {
-                    if (!chapter || chapter.id == null) return;
-                    const key = String(chapter.id);
-                    // Payload rows carry the exact number and a real timestamp,
-                    // so let them replace anything scraped for the same chapter.
-                    if (byId.has(key) && !(isPayload && !fromPayload.has(key))) return;
-                    byId.set(key, chapter);
-                    if (isPayload) fromPayload.add(key);
-                };
+                try {
+                    const mainResponse = await fetch(MAIN_SCRIPT_URL);
+                    if (!mainResponse.ok) throw new Error('Could not load main bundle');
+                    const mainJavaScript = await mainResponse.text();
+                    const environmentFile = mainJavaScript.match(
+                        /from\s*["']\.\/(env-[^"']+\.js)["']/
+                    );
+                    if (!environmentFile) throw new Error('Could not find environment bundle');
 
-                // --- Payload hooks: enrich pages fetched from here on. ---
-                const original = JSON.parse;
-                const isChapterList = (arr) =>
-                    Array.isArray(arr) && arr.length > 0 && arr[0] &&
-                    arr[0].id !== undefined && arr[0].number !== undefined &&
-                    arr[0].url !== undefined;
-                const takePayload = (parsed) => {
-                    try {
-                        const result = parsed && parsed.result ? parsed.result : parsed;
-                        const items = result && result.items;
-                        if (!isChapterList(items)) return;
-                        for (const ch of items) {
-                            const group = ch.group || null;
-                            put({
-                                id: ch.id,
-                                number: typeof ch.number === 'number' ? ch.number : number(ch.number),
-                                volume: typeof ch.volume === 'number' ? ch.volume : null,
-                                name: ch.name || null,
-                                url: ch.url || null,
-                                groupId: group && group.id != null ? group.id : null,
-                                groupName: group && group.name ? group.name :
-                                    (ch.isOfficial ? 'Official' : null),
-                                official: !!ch.isOfficial,
-                                createdAt: typeof ch.createdAt === 'number' ? ch.createdAt : null,
-                                date: ch.createdAtFormatted || null
-                            }, true);
-                        }
-                    } catch (e) {}
-                };
-                JSON.parse = function () {
-                    const parsed = original.apply(this, arguments);
-                    takePayload(parsed);
-                    return parsed;
-                };
-                if (typeof window.fetch === 'function') {
-                    const originalFetch = window.fetch;
-                    window.fetch = function () {
-                        return originalFetch.apply(this, arguments).then((response) => {
-                            try {
-                                response.clone().text().then((body) => {
-                                    try { takePayload(original(body)); } catch (e) {}
-                                }).catch(() => {});
-                            } catch (e) {}
-                            return response;
-                        });
-                    };
-                }
-                const originalSend = XMLHttpRequest.prototype.send;
-                XMLHttpRequest.prototype.send = function () {
-                    this.addEventListener('load', function () {
-                        try { takePayload(original(this.responseText)); } catch (e) {}
-                    });
-                    return originalSend.apply(this, arguments);
-                };
+                    // A bare import() in an injected script is parsed in the wrong
+                    // context; going through Function keeps it a real dynamic import.
+                    const importBundle = new Function('url', 'return import(url)');
+                    const environment = await importBundle(
+                        new URL(environmentFile[1], MAIN_SCRIPT_URL).href
+                    );
+                    const mangaApi = Object.values(environment).find((value) =>
+                        value &&
+                        typeof value === 'object' &&
+                        typeof value.chapters === 'function'
+                    );
+                    if (!mangaApi) throw new Error('Could not find manga API');
 
-                // --- Fast path: call the site's own chapter API directly. ---
-                //
-                // The signing key lives in a lazily imported `env-*.js` bundle that the
-                // main module references; importing it hands us the same api object the
-                // page uses, so `chapters()` signs and decrypts for us. One call returns
-                // 100 chapters, against the 20 a rendered page shows — and with no DOM to
-                // wait on, which is what the pager walk below spends nearly all its time
-                // doing. It stays as the fallback for when the bundle layout changes.
-                const fetchViaApi = async () => {
-                    try {
-                        const found = await waitFor(
-                            () => !!document.querySelector('script[type=module][src*="/dist/main-"]'),
-                            $BUNDLE_WAIT_MS,
-                        );
-                        if (!found) return null;
-                        const mainScriptUrl = document
-                            .querySelector('script[type=module][src*="/dist/main-"]').src;
-                        if (!mainScriptUrl) return null;
-
-                        const mainResponse = await fetch(mainScriptUrl);
-                        if (!mainResponse.ok) return null;
-                        const mainJavaScript = await mainResponse.text();
-                        const environmentFile = mainJavaScript.match(
-                            /from\s*["']\.\/(env-[^"']+\.js)["']/
-                        );
-                        if (!environmentFile) return null;
-
-                        // A bare `import()` in an injected script is parsed in the wrong
-                        // context; going through Function keeps it a real dynamic import.
-                        const importBundle = new Function('url', 'return import(url)');
-                        const environment = await importBundle(
-                            new URL(environmentFile[1], mainScriptUrl).href
-                        );
-                        const mangaApi = Object.values(environment).find((value) =>
-                            value && typeof value === 'object' && typeof value.chapters === 'function'
-                        );
-                        if (!mangaApi) return null;
-
-                        const askFor = (page) => mangaApi.chapters(MANGA_ID, {
+                    const collected = [];
+                    let page = 1;
+                    while (page <= $MAX_CHAPTER_API_PAGES) {
+                        const response = await mangaApi.chapters(MANGA_ID, {
                             page: page,
                             limit: 100,
                             order: { number: 'desc' }
                         });
-                        const rowsOf = (response) => response && (response.items ||
+                        const pageItems = response && (response.items ||
                             (response.result && response.result.items));
+                        if (!Array.isArray(pageItems) || pageItems.length === 0) break;
 
-                        const first = await askFor(1);
-                        const firstItems = rowsOf(first);
-                        if (!Array.isArray(firstItems)) return null;
-                        if (firstItems.length === 0) return 'empty';
-                        takePayload({ items: firstItems });
+                        collected.push(...pageItems);
+                        if (pageItems.some((item) => item.id === LATEST_CHAPTER_ID)) break;
 
-                        // The first response reports how many pages there are, so the
-                        // rest do not have to be discovered one at a time — they go out
-                        // together and the whole list arrives in two round trips instead
-                        // of one per hundred chapters.
-                        const meta = first.meta || first.pagination || {};
-                        const lastPage = Math.min(
-                            meta.lastPage || meta.last_page || 1,
-                            $MAX_CHAPTER_API_PAGES,
-                        );
+                        const meta = response.meta || response.pagination || {};
+                        const lastPage = meta.lastPage || meta.last_page || page;
+                        if (!(meta.hasNext || page < lastPage)) break;
+                        page++;
+                    }
 
-                        if (lastPage > 1) {
-                            let nextPage = 2;
-                            const worker = async () => {
-                                for (;;) {
-                                    const page = nextPage++;
-                                    if (page > lastPage) return;
-                                    const items = rowsOf(await askFor(page));
-                                    if (Array.isArray(items) && items.length > 0) {
-                                        takePayload({ items: items });
-                                    }
-                                }
-                            };
-                            const workers = Math.min($CHAPTER_API_CONCURRENCY, lastPage - 1);
-                            await Promise.all(Array.from({ length: workers }, worker));
-                        } else if (meta.hasNext) {
-                            // No page count to fan out over, so walk it the slow way.
-                            let page = 2;
-                            while (page <= $MAX_CHAPTER_API_PAGES) {
-                                const response = await askFor(page);
-                                const items = rowsOf(response);
-                                if (!Array.isArray(items) || items.length === 0) break;
-                                takePayload({ items: items });
-                                const pageMeta = response.meta || response.pagination || {};
-                                if (!pageMeta.hasNext) break;
-                                page++;
-                            }
+                    // --- Compact the result for the fragment-URL trip back. ---
+                    let prefix = collected.length ? String(collected[0].url || '') : '';
+                    for (const chapter of collected) {
+                        const url = String(chapter.url || '');
+                        let i = 0;
+                        while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
+                        prefix = prefix.slice(0, i);
+                    }
+
+                    const groups = [];
+                    const groupIndex = new Map();
+                    const items = collected.map((chapter) => {
+                        const group = chapter.group || null;
+                        const official = chapter.isOfficial ? 1 : 0;
+                        const groupId = group && group.id != null ? group.id : null;
+                        const groupName = group && group.name
+                            ? group.name
+                            : (official ? 'Official' : null);
+                        const key = (groupId != null ? 'i' + groupId : 'n' + (groupName || '')) +
+                            '|' + official;
+                        let g = groupIndex.get(key);
+                        if (g === undefined) {
+                            g = groups.length;
+                            groupIndex.set(key, g);
+                            const entry = { o: official };
+                            if (groupId != null) entry.id = groupId;
+                            if (groupName) entry.name = groupName;
+                            groups.push(entry);
                         }
-                        // Zero rows from a working API means the title really has none;
-                        // a thrown/absent api means we learned nothing and must fall back.
-                        return byId.size > 0 ? 'ok' : 'empty';
-                    } catch (e) {
-                        return null;
-                    }
-                };
+                        const row = {
+                            i: chapter.id,
+                            n: typeof chapter.number === 'number'
+                                ? chapter.number
+                                : Number(chapter.number) || 0,
+                            u: String(chapter.url || '').slice(prefix.length),
+                            g: g
+                        };
+                        if (chapter.volume != null) row.v = chapter.volume;
+                        if (chapter.name) row.t = chapter.name;
+                        if (typeof chapter.createdAt === 'number') row.c = chapter.createdAt;
+                        else if (chapter.createdAtFormatted) row.d = chapter.createdAtFormatted;
+                        return row;
+                    });
 
-                // --- The rendered list: always available, whatever our timing. ---
-                const scrape = () => {
-                    const rows = document.querySelectorAll('.mchap-list .mchap-item');
-                    for (const row of rows) {
-                        const link = row.querySelector('a.mchap-row__primary');
-                        const href = link ? link.getAttribute('href') : null;
-                        if (!href) continue;
-                        // The id leads the last path segment; matching it
-                        // anywhere would pick up a title slug that starts with
-                        // digits instead, collapsing every chapter into one.
-                        const slug = href.split('?')[0].split('/').filter(Boolean).pop() || '';
-                        const idMatch = /^(\d+)-/.exec(slug);
-                        if (!idMatch) continue;
-                        const groupLink = row.querySelector('a.mchap-row__group');
-                        const groupNode = groupLink || row.querySelector('.mchap-row__group');
-                        const groupId = groupLink
-                            ? /\/groups\/(\d+)/.exec(groupLink.getAttribute('href') || '')
-                            : null;
-                        const groupName = groupNode ? (groupNode.textContent || '').trim() : '';
-                        put({
-                            id: Number(idMatch[1]),
-                            number: number(text(row, '.mchap-row__ch')),
-                            volume: number(text(row, '.mchap-row__vol')),
-                            name: text(row, '.mchap-row__title') || null,
-                            url: href,
-                            groupId: groupId ? Number(groupId[1]) : null,
-                            groupName: groupName || null,
-                            official: !!(groupNode && groupNode.classList.contains('is-official')),
-                            createdAt: null,
-                            date: text(row, '.mchap-row__time') || null
-                        }, false);
-                    }
-                    return rows.length;
-                };
-
-                // --- Walk the pager. ---
-                // `.mchap-foot__hint` reads "Showing 21 to 40 of 300 items", so it
-                // is both the progress marker and the signal that a click landed.
-                const hint = () => text(document, '.mchap-foot__hint');
-                const isComplete = () => {
-                    const match = /Showing\s+[\d,]+\s+to\s+([\d,]+)\s+of\s+([\d,]+)/i.exec(hint());
-                    if (!match) return false;
-                    return Number(match[1].replace(/,/g, '')) >= Number(match[2].replace(/,/g, ''));
-                };
-                const currentPage = () => {
-                    const active = document.querySelector('.mchap-foot .npager button.npager__num.is-active');
-                    const marked = active ? Number((active.textContent || '').trim()) : NaN;
-                    if (marked > 0) return marked;
-                    const match = /Showing\s+([\d,]+)\s+to\s+([\d,]+)/i.exec(hint());
-                    if (!match) return 1;
-                    const from = Number(match[1].replace(/,/g, ''));
-                    const to = Number(match[2].replace(/,/g, ''));
-                    const size = to - from + 1;
-                    return size > 0 ? Math.floor((from - 1) / size) + 1 : 1;
-                };
-
-                /**
-                 * The pager only draws its Next arrow while the numeric window
-                 * has not yet reached the final page, so Next is already gone on
-                 * the second-to-last page — and on every series short enough to
-                 * fit the whole window, it never appears at all. The numbered
-                 * button for the following page is always on screen though, so
-                 * paging by number is what actually reaches the end.
-                 */
-                const nextButton = () => {
-                    const buttons = document.querySelectorAll('.mchap-foot .npager button');
-                    const wanted = currentPage() + 1;
-                    for (const button of buttons) {
-                        if (button.disabled) continue;
-                        if (Number((button.textContent || '').trim()) === wanted) return button;
-                    }
-                    for (const button of buttons) {
-                        if (button.disabled) continue;
-                        const label = button.getAttribute('aria-label') || '';
-                        if (/next/i.test(label)) return button;
-                    }
-                    return null;
-                };
-                const firstButton = () => {
-                    const buttons = document.querySelectorAll('.mchap-foot .npager button');
-                    for (const button of buttons) {
-                        if (button.disabled) continue;
-                        const label = button.getAttribute('aria-label') || '';
-                        if (/first/i.test(label)) return button;
-                    }
-                    return null;
-                };
-                const total = () => {
-                    const match = /of\s+([\d,]+)\s+items/i.exec(hint());
-                    return match ? Number(match[1].replace(/,/g, '')) : 0;
-                };
-                const isEmptyState = () => !!document.querySelector('.mpage__chapters .uempty');
-                const hasRows = () => !!document.querySelector('.mchap-list .mchap-item');
-
-                // Identifies which rows are on screen, so a page is only read
-                // once it has stopped changing — scraping the instant the first
-                // row appears can catch a half-rendered list.
-                const rowSignature = () => {
-                    const rows = document.querySelectorAll('.mchap-list .mchap-item a.mchap-row__primary');
-                    let signature = rows.length + ':';
-                    for (const row of rows) signature += (row.getAttribute('href') || '') + ',';
-                    return signature;
-                };
-                const settle = async () => {
-                    let previous = null;
-                    for (let i = 0; i < 100; i++) {
-                        const current = rowSignature();
-                        if (previous !== null && current === previous) return;
-                        previous = current;
-                        await sleep(100);
-                    }
-                };
-
-                const walk = async () => {
-                    while (!isComplete()) {
-                        const button = nextButton();
-                        if (!button) break;
-                        const before = hint();
-                        // Read the page being left as well, so a click that
-                        // lands late cannot cost the rows already on screen.
-                        scrape();
-                        button.click();
-                        // A click that does not register would otherwise cost a
-                        // whole page, so give it one more go before bailing out.
-                        if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) {
-                            const retry = nextButton();
-                            if (!retry) break;
-                            retry.click();
-                            if (!await waitFor(() => hint() !== before, CLICK_TIMEOUT)) break;
-                        }
-                        await settle();
-                        scrape();
-                    }
-                };
-
-                // --- Compact the result for the fragment-URL trip back. ---
-                const compact = (isEmpty) => {
-                const collected = [...byId.values()];
-                let prefix = collected.length ? String(collected[0].url || '') : '';
-                for (const chapter of collected) {
-                    const url = String(chapter.url || '');
-                    let i = 0;
-                    while (i < prefix.length && i < url.length && prefix[i] === url[i]) i++;
-                    prefix = prefix.slice(0, i);
+                    return JSON.stringify({
+                        prefix: prefix,
+                        groups: groups,
+                        items: items,
+                        empty: items.length === 0
+                    });
+                } catch (error) {
+                    return JSON.stringify({
+                        error: String((error && error.message) || error)
+                    });
                 }
-
-                const groups = [];
-                const groupIndex = new Map();
-                const items = collected.map((chapter) => {
-                    const official = chapter.official ? 1 : 0;
-                    const key = (chapter.groupId != null ? 'i' + chapter.groupId : 'n' + (chapter.groupName || '')) +
-                        '|' + official;
-                    let g = groupIndex.get(key);
-                    if (g === undefined) {
-                        g = groups.length;
-                        groupIndex.set(key, g);
-                        const entry = { o: official };
-                        if (chapter.groupId != null) entry.id = chapter.groupId;
-                        if (chapter.groupName) entry.name = chapter.groupName;
-                        groups.push(entry);
-                    }
-                    const row = {
-                        i: chapter.id,
-                        n: chapter.number,
-                        u: String(chapter.url || '').slice(prefix.length),
-                        g: g
-                    };
-                    if (chapter.volume != null) row.v = chapter.volume;
-                    if (chapter.name) row.t = chapter.name;
-                    if (chapter.createdAt != null) row.c = chapter.createdAt;
-                    else if (chapter.date) row.d = chapter.date;
-                    return row;
-                });
-
-                return JSON.stringify({
-                    prefix: prefix,
-                    groups: groups,
-                    items: items,
-                    empty: items.length === 0 && isEmpty
-                });
-                };
-
-                const apiResult = await fetchViaApi();
-                if (apiResult) return compact(apiResult === 'empty');
-
-                // --- Fallback: read the rendered list and click through the pager. ---
-                await waitFor(() => hasRows() || isEmptyState());
-                await settle();
-                scrape();
-                await walk();
-
-                // The site reports how many chapters exist, so a short result
-                // means a click never landed and a whole page was skipped.
-                // Rewinding and walking once more recovers it.
-                const expected = total();
-                if (expected > 0 && byId.size < expected) {
-                    const first = firstButton();
-                    if (first) {
-                        first.click();
-                        await waitFor(() => /Showing\s+1\s+to/i.test(hint()));
-                        await settle();
-                        scrape();
-                        await walk();
-                    }
-                }
-
-                return compact(isEmptyState());
             })()
         """
 
@@ -1494,6 +1177,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
+                if (isCloudflareChallenge()) return null;
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1534,7 +1218,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
-                    if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
+                    if (isCloudflareChallenge()) return null;
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {
@@ -1546,7 +1230,7 @@ $CLOUDFLARE_DETECT_JS
                             }
                         }
                     } catch (e) {}
-                    await sleep($CLOUDFLARE_POLL_MS);
+                    await sleep(100);
                 }
                 return JSON.stringify({ error: 'no browse data captured' });
             })()
@@ -1558,6 +1242,7 @@ $CLOUDFLARE_DETECT_JS
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 $CLOUDFLARE_DETECT_JS
+                if (isCloudflareChallenge()) return null;
                 const original = JSON.parse;
                 let captured = null;
                 const take = (obj) => {
@@ -1598,7 +1283,7 @@ $CLOUDFLARE_DETECT_JS
                 };
                 for (let i = 0; i < 300; i++) {
                     if (captured) return captured;
-                    if (cloudflareBlocking()) return '$CLOUDFLARE_BLOCKED';
+                    if (isCloudflareChallenge()) return null;
                     try {
                         const node = document.querySelector('script#initial-data');
                         if (node && node.textContent) {
@@ -1608,7 +1293,7 @@ $CLOUDFLARE_DETECT_JS
                             }
                         }
                     } catch (e) {}
-                    await sleep($CLOUDFLARE_POLL_MS);
+                    await sleep(100);
                 }
                 return JSON.stringify({ error: 'no page data captured' });
             })()
