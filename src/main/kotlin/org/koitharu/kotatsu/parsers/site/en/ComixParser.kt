@@ -760,7 +760,8 @@ internal class Comix(context: MangaLoaderContext) :
                     val message = resultUrl.queryParameterValue("msg") ?: "unknown WebView error"
                     throw ParseException("Comix WebView API failed: $message", pageUrl)
                 }
-                else -> resultUrl.queryParameterValue("data")
+                else -> resultUrl.base64QueryParameterValue("data64")
+                    ?: resultUrl.queryParameterValue("data")
                     ?: throw ParseException("Comix WebView API bridge result missing data", pageUrl)
             }
             if (decoded == WEBVIEW_LOAD_FAILED) {
@@ -809,8 +810,20 @@ internal class Comix(context: MangaLoaderContext) :
                             window[state] = false;
                             return;
                         }
-                        window.location.href = "$INTERCEPT_RESULT_URL#data=" +
-                            encodeURIComponent(String(result));
+                        const bytes = new TextEncoder().encode(String(result));
+                        let binary = '';
+                        const chunkSize = 0x8000;
+                        for (let i = 0; i < bytes.length; i += chunkSize) {
+                            binary += String.fromCharCode.apply(
+                                null,
+                                bytes.subarray(i, Math.min(i + chunkSize, bytes.length))
+                            );
+                        }
+                        const data = btoa(binary)
+                            .replace(/\+/g, '-')
+                            .replace(/\//g, '_')
+                            .replace(/=+$/g, '');
+                        window.location.href = "$INTERCEPT_RESULT_URL#data64=" + data;
                     } catch (e) {
                         window.location.href = "$INTERCEPT_ERROR_URL#msg=" +
                             encodeURIComponent(String((e && e.message) || e));
@@ -820,7 +833,7 @@ internal class Comix(context: MangaLoaderContext) :
         """.trimIndent()
     }
 
-    private fun String.queryParameterValue(name: String): String? {
+    private fun String.rawQueryParameterValue(name: String): String? {
         val query = substringAfter('#', substringAfter('?', ""))
         if (query.isEmpty()) return null
         return query.split('&')
@@ -828,7 +841,19 @@ internal class Comix(context: MangaLoaderContext) :
             .map { it.split('=', limit = 2) }
             .firstOrNull { it.size == 2 && it[0] == name }
             ?.get(1)
+    }
+
+    private fun String.queryParameterValue(name: String): String? {
+        return rawQueryParameterValue(name)
             ?.let { URLDecoder.decode(it, StandardCharsets.UTF_8.name()) }
+    }
+
+    private fun String.base64QueryParameterValue(name: String): String? {
+        return rawQueryParameterValue(name)?.let { encoded ->
+            runCatching {
+                String(Base64.getUrlDecoder().decode(encoded), StandardCharsets.UTF_8)
+            }.getOrNull()
+        }
     }
 
     private fun String.toJsString(): String {
@@ -1270,7 +1295,10 @@ $CLOUDFLARE_DETECT_JS
         // JS, so we hook `JSON.parse` (catches the decrypted object), `fetch` and
         // `XMLHttpRequest` (catch plain responses), plus poll `script#initial-data`
         // as a backstop. Resolves with the first `{ result: { items: [...] } }`
-        // payload as a JSON string for the bridge to hand back.
+        // payload as a compact JSON string for the bridge to hand back. Browse
+        // responses include many fields the listing never consumes, especially
+        // dozens of translated alternate titles per item; carrying those through
+        // a WebView navigation and then into Manga objects causes avoidable delay.
         private const val BROWSE_CAPTURE_SCRIPT = """
             (async () => {
                 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -1279,12 +1307,48 @@ $CLOUDFLARE_DETECT_JS
                 if (isCloudflareChallenge()) return '$CLOUDFLARE_BLOCKED';
                 const original = JSON.parse;
                 let captured = null;
+                const compactNamedItems = (values) => {
+                    if (!Array.isArray(values)) return undefined;
+                    return values.map((value) => {
+                        if (!value || typeof value !== 'object') return null;
+                        const item = {};
+                        if (value.id != null) item.id = value.id;
+                        if (value.title) item.title = value.title;
+                        else if (value.name) item.name = value.name;
+                        return item;
+                    }).filter((value) => value && (value.title || value.name));
+                };
+                const compactItem = (item) => {
+                    const result = {
+                        hid: item.hid || item.hash_id || '',
+                        title: item.title || ''
+                    };
+                    if (item.synopsis) result.synopsis = item.synopsis;
+                    if (item.status) result.status = item.status;
+                    if (item.contentRating) result.contentRating = item.contentRating;
+                    if (item.ratedAvg != null) result.ratedAvg = item.ratedAvg;
+                    else if (item.rated_avg != null) result.rated_avg = item.rated_avg;
+                    if (item.poster && typeof item.poster === 'object') {
+                        result.poster = {};
+                        if (item.poster.large) result.poster.large = item.poster.large;
+                        if (item.poster.medium) result.poster.medium = item.poster.medium;
+                        if (item.poster.small) result.poster.small = item.poster.small;
+                    }
+                    const termKeys = ['genres', 'genre', 'tags', 'theme', 'demographics', 'demographic', 'formats'];
+                    for (const key of termKeys) {
+                        const values = compactNamedItems(item[key]);
+                        if (values && values.length) result[key] = values;
+                    }
+                    const authors = compactNamedItems(item.authors || item.author);
+                    if (authors && authors.length) result.authors = authors;
+                    return result;
+                };
                 const take = (obj) => {
                     if (captured) return true;
                     try {
                         const items = obj && obj.result && obj.result.items;
                         if (Array.isArray(items) && items.length > 0) {
-                            captured = JSON.stringify(obj);
+                            captured = JSON.stringify({ result: { items: items.map(compactItem) } });
                             return true;
                         }
                     } catch (e) {}
