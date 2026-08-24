@@ -1,5 +1,7 @@
 package org.koitharu.kotatsu.parsers.site.all
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -20,6 +22,7 @@ import org.koitharu.kotatsu.parsers.model.MangaListFilterCapabilities
 import org.koitharu.kotatsu.parsers.model.MangaListFilterOptions
 import org.koitharu.kotatsu.parsers.model.MangaPage
 import org.koitharu.kotatsu.parsers.model.MangaParserSource
+import org.koitharu.kotatsu.parsers.model.MangaSource
 import org.koitharu.kotatsu.parsers.model.MangaState
 import org.koitharu.kotatsu.parsers.model.MangaTag
 import org.koitharu.kotatsu.parsers.model.RATING_UNKNOWN
@@ -109,19 +112,22 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		}
 	}
 
-	override suspend fun getDetails(manga: Manga): Manga {
+	override suspend fun getDetails(manga: Manga): Manga = coroutineScope {
 		val slug = manga.url.substringAfterLast('/')
 		val detailsUrl = "$apiBaseUrl/api/manga/title/$slug"
-		val details = apiGetJson(detailsUrl)
-		val info = details.optJSONObject("manga") ?: return manga
-		val passwordInfo = runCatching {
-			val passwordUrl = "$apiBaseUrl/api/manga/password/info/$slug"
-			apiGetJson(passwordUrl)
-		}.getOrNull()
+		val passwordUrl = "$apiBaseUrl/api/manga/password/info/$slug"
 		val chaptersUrl = "$apiBaseUrl/api/manga/$slug"
-		val chaptersRoot = apiGetJson(chaptersUrl)
+		val detailsDeferred = async { apiGetJson(detailsUrl) }
+		val passwordDeferred = async {
+			runCatching { apiGetJson(passwordUrl) }.getOrNull()
+		}
+		val chaptersDeferred = async { apiGetJson(chaptersUrl) }
+		val details = detailsDeferred.await()
+		val info = details.optJSONObject("manga") ?: return@coroutineScope manga
+		val passwordInfo = passwordDeferred.await()
+		val chaptersRoot = chaptersDeferred.await()
 
-		return parseManga(info).copy(
+		parseManga(info).copy(
 			id = manga.id,
 			url = manga.url,
 			publicUrl = manga.publicUrl,
@@ -250,7 +256,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 			tags = tags,
 			state = parseState(json.optString("publication_status")),
 			authors = authors,
-			largeCoverUrl = json.optString("banner_url").nullIfEmpty(),
+			largeCoverUrl = json.optString("cover_url").nullIfEmpty(),
 			description = json.optString("description").nullIfEmpty(),
 			source = source,
 		)
@@ -369,11 +375,12 @@ internal class LunarAnime(context: MangaLoaderContext) :
 			.toCollection(LinkedHashSet())
 	}
 
-	private suspend fun apiGetJson(url: String): JSONObject {
+	private suspend fun apiGetJson(url: String, requiresDeviceKey: Boolean = false): JSONObject {
 		val request = Request.Builder()
 			.get()
 			.url(url)
-			.headers(apiHeaders("GET", url))
+			.headers(apiHeaders("GET", url, requiresDeviceKey))
+			.tag(MangaSource::class.java, source)
 			.build()
 		return context.httpClient.newCall(request).await().use { response ->
 			val body = response.body.string()
@@ -387,8 +394,8 @@ internal class LunarAnime(context: MangaLoaderContext) :
 		}
 	}
 
-	private suspend fun apiHeaders(method: String, url: String): Headers {
-		val dpop = signUrl(method, url.substringBefore('?'))
+	private suspend fun apiHeaders(method: String, url: String, requiresDeviceKey: Boolean): Headers {
+		val dpop = if (requiresDeviceKey) signUrl(method, url.substringBefore('?')) else ""
 		return getRequestHeaders().newBuilder().apply {
 			if (dpop.isNotEmpty()) {
 				add("dpop", dpop)
@@ -510,7 +517,7 @@ internal class LunarAnime(context: MangaLoaderContext) :
 
 	private suspend fun fetchSessionData(token: String, lang: String): String {
 		val url = "$apiBaseUrl/api/manga/r/$token?language=$lang"
-		val root = apiGetJson(url)
+		val root = apiGetJson(url, requiresDeviceKey = true)
 		return root.optJSONObject("data")
 			?.optString("session_data")
 			?.nullIfEmpty()

@@ -208,11 +208,19 @@ internal class Voratoon(context: MangaLoaderContext) :
 			val id = jo.optLong("id")
 			if (id <= 0L) continue
 			val data = jo.optJSONObject("data")
+			val number = jo.optDouble("chapterIndex", 0.0).toFloat()
+			val chapterLabel = "Chapter ${formatChapterNumber(number)}"
+			val rawTitle = data?.optString("title")?.trim()?.takeIf { it.isNotEmpty() }
+			val title = when {
+				rawTitle == null -> chapterLabel
+				rawTitle.startsWith(chapterLabel, ignoreCase = true) -> rawTitle
+				else -> "$chapterLabel - $rawTitle"
+			}
 			result.add(
 				MangaChapter(
 					id = generateUid(id),
-					title = data?.optString("title")?.takeIf { it.isNotBlank() },
-					number = jo.optDouble("chapterIndex", 0.0).toFloat(),
+					title = title,
+					number = number,
 					volume = 0,
 					url = "/series/$slug/chapters/$id",
 					scanlator = null,
@@ -222,8 +230,15 @@ internal class Voratoon(context: MangaLoaderContext) :
 				),
 			)
 		}
-		return result
+		return result.sortedWith(
+			compareBy<MangaChapter> { it.number }
+				.thenBy { it.uploadDate }
+				.thenBy { it.id },
+		)
 	}
+
+	private fun formatChapterNumber(number: Float): String =
+		if (number % 1f == 0f) number.toInt().toString() else number.toString()
 
 	// createdAt example: 2026-08-16T17:21:23.416+00:00
 	private fun parseChapterDate(value: String): Long {
