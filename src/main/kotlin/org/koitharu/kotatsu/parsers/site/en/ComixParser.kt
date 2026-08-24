@@ -2,10 +2,12 @@ package org.koitharu.kotatsu.parsers.site.en
 
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
+import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.internal.closeQuietly
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -128,7 +130,11 @@ internal class Comix(context: MangaLoaderContext) :
                 addParam("sort=relevance:desc")
             } else {
                 when (order) {
-                    SortOrder.RELEVANCE -> addParam("order[relevance]=desc")
+                    // Relevance is only meaningful alongside a keyword, and it is
+                    // not an `order[...]` field at all — the site passes it as
+                    // `sort=relevance:desc`. With no query it falls back to the
+                    // latest-update ordering, same as the website does.
+                    SortOrder.RELEVANCE -> addParam("order[chapter_updated_at]=desc")
                     SortOrder.UPDATED -> addParam("order[chapter_updated_at]=desc")
                     SortOrder.POPULARITY -> addParam("order[views_30d]=desc")
                     SortOrder.NEWEST -> addParam("order[created_at]=desc")
@@ -246,7 +252,7 @@ internal class Comix(context: MangaLoaderContext) :
             publicUrl = "https://comix.to/title/$hashId",
             coverUrl = coverUrl,
             title = title,
-            altTitles = emptySet(),
+            altTitles = parseAltTitles(json),
             description = description,
             rating = if (rating > 0) (rating / 10.0).toFloat() else RATING_UNKNOWN,
             tags = parseTerms(json),
@@ -318,21 +324,35 @@ internal class Comix(context: MangaLoaderContext) :
             } else {
                 "$baseUrl/${rawUrl.trimStart('/')}"
             }
-            // `s == 1` marks a "v3" tile-scrambled image. The server only returns
-            // the x-scramble-*/x-enc-* headers when the request carries the `v3`
-            // query flag, so we add it here; the interceptor then descrambles based
-            // on those headers. The `#scrambled` fragment (dropped before the request
-            // is sent) keeps scrambled pages from colliding with any unscrambled
-            // namesake in the cache.
-            val finalUrl = if (item?.optInt("s", 0) == 1) {
-                val withV3 = if (imageUrl.toHttpUrl().queryParameterNames.contains("v3")) {
-                    imageUrl
-                } else {
-                    imageUrl.toHttpUrl().newBuilder().addQueryParameter("v3", null).build().toString()
+            // `s == 1` (or a `v3` flag already on the url) marks a "v3" tile-scrambled
+            // image. The server only returns the x-scramble-* headers when the request
+            // carries the `v3` query flag, so we add it here; the interceptor then
+            // descrambles based on those headers.
+            //
+            // Everything else may still be protected by the older byte-level XOR, which
+            // the server applies to every fourth page. Those responses only carry
+            // x-enc-seed when the request has an `Origin` header — the exact opposite of
+            // the v3 images, which withhold x-scramble-seed when `Origin` is present —
+            // so the two kinds are tagged apart here and [intercept] sets the header for
+            // the legacy ones only.
+            //
+            // Both fragments are dropped before the request goes out; they also keep a
+            // protected page from colliding with an unprotected namesake in the cache.
+            val parsedUrl = imageUrl.toHttpUrlOrNull()
+            val isV3 = item?.optInt("s", 0) == 1 || parsedUrl?.queryParameterNames?.contains("v3") == true
+            val isLegacyScramble = !isV3 && (i + 1) % 4 == 0
+            val finalUrl = when {
+                isV3 -> {
+                    val withV3 = if (parsedUrl == null || parsedUrl.queryParameterNames.contains("v3")) {
+                        imageUrl
+                    } else {
+                        parsedUrl.newBuilder().addQueryParameter("v3", null).build().toString()
+                    }
+                    "$withV3#$SCRAMBLED_FRAGMENT"
                 }
-                "$withV3#$SCRAMBLED_FRAGMENT"
-            } else {
-                imageUrl
+
+                isLegacyScramble -> "$imageUrl#$LEGACY_SCRAMBLED_FRAGMENT"
+                else -> imageUrl
             }
             MangaPage(
                 id = generateUid("$chapterId-$i"),
@@ -344,7 +364,18 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val response = chain.proceed(chain.request())
+        // Legacy byte-XOR images only come back with their x-enc-* headers when the
+        // request carries an `Origin`; v3 tile-scrambled ones do the reverse and
+        // withhold x-scramble-seed when it is present, so it is added for the pages
+        // [getPages] tagged as legacy and for nothing else.
+        val request = chain.request().let { original ->
+            if (original.url.fragment == LEGACY_SCRAMBLED_FRAGMENT && original.header("Origin") == null) {
+                original.newBuilder().header("Origin", "https://$domain").build()
+            } else {
+                original
+            }
+        }
+        val response = retryScramblePathFallbacks(chain, request, chain.proceed(request))
         if (!response.isSuccessful) {
             return response
         }
@@ -397,10 +428,43 @@ internal class Comix(context: MangaLoaderContext) :
         }
     }
 
+    /**
+     * The CDN keeps the same image under several interchangeable path segments
+     * (`/i5/`, `/si/`, `/i/`, `/sii/`, `/ii/`) and the one the page list hands out
+     * is not always the one that exists, so a 404 is retried against the others
+     * before giving up.
+     */
+    private fun retryScramblePathFallbacks(
+        chain: Interceptor.Chain,
+        request: Request,
+        response: Response,
+    ): Response {
+        if (response.code != 404) {
+            return response
+        }
+        val url = request.url.toString()
+        val fallbacks = SCRAMBLE_PATH_FALLBACKS
+            .map { url.replaceFirst(SCRAMBLE_PATH_FALLBACK_REGEX, it) }
+            .filter { it != url }
+        if (fallbacks.isEmpty()) {
+            return response
+        }
+        var lastResponse = response
+        for (fallbackUrl in fallbacks) {
+            lastResponse.closeQuietly()
+            lastResponse = chain.proceed(request.newBuilder().url(fallbackUrl).build())
+            if (lastResponse.code != 404) {
+                break
+            }
+        }
+        return lastResponse
+    }
+
     // A handful of older images ship a constant hash that gets folded into the
     // scramble seed; everything else (and the modern format) uses the seed as-is.
     private fun decodeScrambleHash(hash: String?): Int = when (hash?.trim()) {
         "03632" -> 58414
+        "02900" -> 117532
         else -> 0
     }
 
@@ -779,6 +843,14 @@ internal class Comix(context: MangaLoaderContext) :
         return null
     }
 
+    /** `altTitles` on the current payload, `alt_titles` on the older one. */
+    private fun parseAltTitles(json: JSONObject): Set<String> {
+        val titles = json.optJSONArray("altTitles") ?: json.optJSONArray("alt_titles") ?: return emptySet()
+        return (0 until titles.length()).mapNotNullTo(LinkedHashSet()) { i ->
+            titles.optString(i).trim().nullIfEmpty()
+        }
+    }
+
     private fun parseAuthors(json: JSONObject): Set<String> {
         val authors = json.optJSONArray("authors") ?: json.optJSONArray("author") ?: return emptySet()
         return (0 until authors.length()).mapNotNullTo(LinkedHashSet()) { i ->
@@ -825,6 +897,9 @@ internal class Comix(context: MangaLoaderContext) :
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
         private val ADULT_EXCLUDE_IDS = listOf("87264", "87266", "87268", "87265") // Adult, Hentai, Smut, Ecchi
         private const val SCRAMBLED_FRAGMENT = "scrambled"
+        private const val LEGACY_SCRAMBLED_FRAGMENT = "enc-scrambled"
+        private val SCRAMBLE_PATH_FALLBACKS = listOf("/i5/", "/si/", "/i/", "/sii/", "/ii/")
+        private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
         private const val GRID_COLS = 5
         private const val GRID_ROWS = 5
         private const val NUM_TILES = GRID_COLS * GRID_ROWS
