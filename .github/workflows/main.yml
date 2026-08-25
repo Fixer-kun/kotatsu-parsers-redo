@@ -1,81 +1,19 @@
-name: Daily Sync & JitPack Trigger
+name: JitPack Trigger
 
 on:
-  schedule:
-    # Runs daily at 00:00 UTC
-    - cron: '0 0 * * *'
   workflow_dispatch: # Manual button trigger from phone
 
-permissions:
-  contents: write
-
 jobs:
-  sync-and-build:
+  ping-jitpack:
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-      with:
-        ref: ${{ github.ref_name }} # Dynamically locks to active branch
-        fetch-depth: 0
-        token: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Sync Fork from Upstream (Preserving Custom Files)
-      id: sync
-      run: |
-        git config user.name "github-actions[bot]"
-        git config user.email "github-actions[bot]@users.noreply.github.com"
-
-        PROTECTED_FILE="src/main/kotlin/org/koitharu/kotatsu/parsers/site/madara/en/MangaDistrict.kt"
-
-        # Add original Kotatsu-Redo upstream remote
-        git remote add upstream https://github.com/Kotatsu-Redo/kotatsu-parsers-redo.git || true
-        git fetch upstream
-
-        # Dynamically detect upstream default branch (master, main, etc.)
-        UPSTREAM_BRANCH=$(git symbolic-ref refs/remotes/upstream/HEAD | sed 's@refs/remotes/upstream/@@' || echo "master")
-        echo "Detected upstream branch: $UPSTREAM_BRANCH"
-
-        # Count how many new commits upstream has that local branch doesn't have
-        NEW_COMMITS_COUNT=$(git rev-list "HEAD..upstream/$UPSTREAM_BRANCH" --count || echo "0")
-        echo "New upstream commits count: $NEW_COMMITS_COUNT"
-
-        if [ "$NEW_COMMITS_COUNT" -eq "0" ]; then
-          echo "No new commits found upstream. Fork is up to date."
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-        else
-          echo "Found $NEW_COMMITS_COUNT new commit(s) upstream! Syncing..."
-          
-          # Merge upstream. '-X theirs' auto-resolves general file conflicts
-          git merge "upstream/$UPSTREAM_BRANCH" -X theirs --no-commit --no-ff || true
-
-          # Restore custom MangaDistrict.kt file from local HEAD
-          git checkout HEAD -- "$PROTECTED_FILE" || true
-          git add "$PROTECTED_FILE"
-
-          # Commit changes
-          git commit -m "Chore: Sync upstream changes (Preserved custom MangaDistrict.kt)" || true
-
-          # Pull remote changes first to avoid push rejection errors
-          git pull --rebase origin "${{ github.ref_name }}"
-          git push origin "${{ github.ref_name }}"
-
-          # Extract short 7-character SHA
-          SHORT_HASH=$(git rev-parse --short=7 HEAD)
-          echo "Updated local short hash: $SHORT_HASH"
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "commit_hash=$SHORT_HASH" >> $GITHUB_OUTPUT
-        fi
 
     - name: Trigger JitPack Build
-      if: steps.sync.outputs.has_changes == 'true' || github.event_name == 'workflow_dispatch'
       run: |
-        COMMIT_HASH=${{ steps.sync.outputs.commit_hash }}
-        if [ -z "$COMMIT_HASH" ]; then
-          COMMIT_HASH=$(git rev-parse --short=7 HEAD)
-        fi
-
+        COMMIT_HASH=$(git rev-parse --short=7 HEAD)
         echo "Pinging JitPack for short commit hash: $COMMIT_HASH"
         
         HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://jitpack.io/com/github/Fixer-kun/kotatsu-parsers-redo/$COMMIT_HASH/kotatsu-parsers-redo-$COMMIT_HASH.pom")
