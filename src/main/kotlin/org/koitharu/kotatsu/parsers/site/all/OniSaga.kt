@@ -131,6 +131,31 @@ internal abstract class OniSagaParser(
 		}
 		val updates = filter.toLivewireUpdates(order)
 		val stateKey = "$pageUrl\n${updates.cacheKey()}"
+		val contentRating = filter.contentRating.oneOrThrowIfMany()
+		val listKey = "${source.name}\n$page\n$stateKey\n${contentRating?.name.orEmpty()}"
+		getCachedMangaList(listKey)?.let { return it }
+		return getMangaListLock(listKey).withLock {
+			getCachedMangaList(listKey) ?: loadListPage(page, pageUrl, stateKey, updates, contentRating).also {
+				cacheMangaList(listKey, it)
+			}
+		}
+	}
+
+	private suspend fun loadListPage(
+		page: Int,
+		pageUrl: String,
+		stateKey: String,
+		updates: LivewireUpdates,
+		contentRating: ContentRating?,
+	): List<Manga> {
+		val topMangaUrl = if (pageUrl == "https://$domain/browse") updates.toTopMangaUrl(domain, page) else null
+		if (topMangaUrl != null) {
+			val rankedManga = runCatchingCancellable {
+				parseRankedMangaList(webClient.httpGet(topMangaUrl).parseHtml())
+					.filter { contentRating == null || it.contentRating == contentRating }
+			}.getOrNull()
+			if (!rankedManga.isNullOrEmpty()) return rankedManga
+		}
 		val directPage = page == 1 && updates.isDefault()
 		var initialState = getCachedState(INITIAL_LIST_STATES, pageUrl)
 		var initialDocument: Document? = null
@@ -149,7 +174,6 @@ internal abstract class OniSagaParser(
 			cacheState(ACTIVE_LIST_STATES, stateKey, result.state)
 			result.document
 		}
-		val contentRating = filter.contentRating.oneOrThrowIfMany()
 		return parseMangaList(document).filter {
 			contentRating == null || it.contentRating == contentRating
 		}
@@ -185,6 +209,42 @@ internal abstract class OniSagaParser(
 	private fun parseMangaList(document: Document): List<Manga> =
 		document.select("div.relative.group").mapNotNull { it.toManga() }.distinctBy(Manga::url)
 
+	private fun parseRankedMangaList(document: Document): List<Manga> = document
+		.select("a[href*='/manga/']")
+		.mapNotNull { link ->
+			val url = link.attrAsRelativeUrlOrNull("href") ?: return@mapNotNull null
+			val segments = url.substringBefore('?').trim('/').split('/')
+			if (segments.firstOrNull() != "manga" || segments.getOrNull(1).isNullOrEmpty()) {
+				return@mapNotNull null
+			}
+			val image = link.selectFirst("img")
+			val title = link.selectFirst("[data-flux-heading], h2, h3, h4, h5")
+				?.text()
+				?.trim()
+				?.nullIfEmpty()
+				?: image?.attr("alt")
+					?.removeSuffix(" manga cover")
+					?.trim()
+					?.nullIfEmpty()
+				?: RANKED_TITLE_REGEX.find(link.text().trim())?.groupValues?.get(1)?.trim()?.nullIfEmpty()
+				?: segments[1].replace('-', ' ').replaceFirstChar { it.titlecase(sourceLocale) }
+			Manga(
+				id = generateUid(url),
+				title = title,
+				altTitles = emptySet(),
+				url = url,
+				publicUrl = url.toAbsoluteUrl(domain),
+				rating = RATING_UNKNOWN,
+				contentRating = if ("18+" in link.text()) ContentRating.ADULT else ContentRating.SAFE,
+				coverUrl = image?.resolveImageUrl(),
+				tags = emptySet(),
+				state = null,
+				authors = emptySet(),
+				source = source,
+			)
+		}
+		.distinctBy(Manga::url)
+
 	private fun Element.toManga(): Manga? {
 		val link = if (tagName() == "a") this else selectFirst("a[href*=\"/manga/\"]") ?: return null
 		val url = link.attrAsRelativeUrlOrNull("href") ?: return null
@@ -210,8 +270,14 @@ internal abstract class OniSagaParser(
 	}
 
 	override suspend fun getDetails(manga: Manga): Manga {
-		val document = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
-		return parseDetails(document, manga).copy(chapters = fetchChapters(document))
+		val detailsUrl = manga.url.toAbsoluteUrl(domain)
+		val detailsKey = "${source.name}\n$detailsUrl"
+		getCachedMangaDetails(detailsKey)?.let { return it }
+		return getMangaDetailsLock(detailsKey).withLock {
+			getCachedMangaDetails(detailsKey) ?: webClient.httpGet(detailsUrl).parseHtml().let { document ->
+				parseDetails(document, manga).copy(chapters = fetchChapters(document))
+			}.also { cacheMangaDetails(detailsKey, it) }
+		}
 	}
 
 	private fun parseDetails(document: Document, fallback: Manga): Manga {
@@ -285,27 +351,45 @@ internal abstract class OniSagaParser(
 	}
 
 	private suspend fun fetchChapters(document: Document): List<MangaChapter> = coroutineScope {
-		val state = document.extractLivewireState(CHAPTER_LIST_COMPONENT)
-			?: return@coroutineScope emptyList()
 		val languages = languageCode?.let(::listOf) ?: LANGUAGE_CODES
+		val state = document.extractLivewireState(CHAPTER_LIST_COMPONENT)
+		val visibleLanguages = document.select("a[href*='/read/']")
+			.mapNotNullTo(linkedSetOf()) { it.chapterLanguage() }
+		val selectedLanguage = state?.selectedChapterLanguage() ?: visibleLanguages.singleOrNull()
+		val initialChapters = languages.associateWith { code ->
+			parseChapters(document, code, matchLanguage = selectedLanguage != code)
+		}
+		val parsedInitial = normalizeChapters(initialChapters.values.flatten())
+		state ?: return@coroutineScope parsedInitial
+		if (parsedInitial.isNotEmpty() && !document.hasMoreChapters()) {
+			return@coroutineScope parsedInitial
+		}
 		languages.map { code ->
-			async { fetchLanguageChapters(document.location(), state, code) }
-		}.awaitAll().flatten()
-			.distinctBy(MangaChapter::url)
-			.groupBy(MangaChapter::branch)
-			.values
-			.sortedByDescending(List<MangaChapter>::size)
-			.flatMap { branch -> branch.sortedBy(MangaChapter::number) }
+			async {
+				val fallback = initialChapters.getValue(code)
+				runCatchingCancellable {
+					fetchLanguageChapters(document.location(), state, code, fallback)
+				}.getOrElse { fallback }
+			}
+		}.awaitAll().flatten().let(::normalizeChapters)
 	}
+
+	private fun normalizeChapters(chapters: List<MangaChapter>): List<MangaChapter> = chapters
+		.distinctBy(MangaChapter::url)
+		.groupBy(MangaChapter::branch)
+		.values
+		.sortedByDescending(List<MangaChapter>::size)
+		.flatMap { branch -> branch.sortedBy(MangaChapter::number) }
 
 	private suspend fun fetchLanguageChapters(
 		referer: String,
 		initialState: LivewireState,
 		code: String,
+		fallback: List<MangaChapter>,
 	): List<MangaChapter> {
 		var snapshot = initialState.snapshot
-		var previousSize = 0
-		var chapters = emptyList<MangaChapter>()
+		var previousSize = fallback.size
+		var chapters = fallback
 		repeat(MAX_CHAPTER_REQUESTS) {
 			val response = webClient.httpPost(
 				"https://$domain/livewire/update".toHttpUrl(),
@@ -320,19 +404,26 @@ internal abstract class OniSagaParser(
 			).parseJson()
 			val component = response.firstComponent() ?: return chapters
 			val html = component.optJSONObject("effects")?.getStringOrNull("html") ?: return chapters
-			val parsed = parseChapters(Jsoup.parseBodyFragment(html, "https://$domain"), code)
+			val chapterDocument = Jsoup.parseBodyFragment(html, "https://$domain")
+			val parsed = parseChapters(chapterDocument, code)
 			if (parsed.size <= previousSize) return chapters
 			chapters = parsed
 			previousSize = parsed.size
+			if (!chapterDocument.hasMoreChapters()) return chapters
 			snapshot = component.getStringOrNull("snapshot") ?: return chapters
 		}
 		return chapters
 	}
 
-	private fun parseChapters(document: Document, language: String): List<MangaChapter> {
+	private fun parseChapters(
+		document: Document,
+		language: String,
+		matchLanguage: Boolean = false,
+	): List<MangaChapter> {
 		val raw = ArrayList<RawChapter>()
 		document.select("a.gap-4:has(div[data-flux-heading])").forEach { element ->
 			val url = element.attrAsRelativeUrlOrNull("href")?.takeIf { "/read/" in it } ?: return@forEach
+			if (matchLanguage && element.chapterLanguage() != language) return@forEach
 			raw.add(
 				RawChapter(
 					number = element.chapterNumber() ?: return@forEach,
@@ -349,10 +440,18 @@ internal abstract class OniSagaParser(
 			var unknownIndex = 1
 			dropdown.select("ui-menu a[data-flux-menu-item]").forEach { link ->
 				val url = link.attrAsRelativeUrlOrNull("href")?.takeIf { "/read/" in it } ?: return@forEach
-				val rawGroup = (
+				if (matchLanguage && link.chapterLanguage() != language) return@forEach
+				val groupText = (
 					link.selectFirst("span.text-sm")?.text()
 						?: link.selectFirst("div.flex.items-center.gap-2 > span:not(.ml-auto)")?.text()
 					).orEmpty().trim()
+				val rawGroup = if (
+					matchLanguage && (groupText == language || groupText.startsWith("$language "))
+				) {
+					groupText.removePrefix(language).trim()
+				} else {
+					groupText
+				}
 				val group = if (rawGroup.isEmpty() || rawGroup.equals("Unknown group", ignoreCase = true)) {
 					"Unknown ${unknownIndex++}"
 				} else {
@@ -379,6 +478,26 @@ internal abstract class OniSagaParser(
 					source = source,
 				)
 			}
+		}
+	}
+
+	private fun Element.chapterLanguage(): String? =
+		CHAPTER_LANGUAGE_REGEX.find(text())?.groupValues?.get(1)
+
+	private fun LivewireState.selectedChapterLanguage(): String? = runCatchingCancellable {
+		val value = JSONObject(snapshot).optJSONObject("data")?.opt("language")
+		when (value) {
+			is String -> value
+			is JSONArray -> value.optString(0)
+			else -> null
+		}?.takeIf(LANGUAGE_CODES::contains)
+	}.getOrNull()
+
+	private fun Document.hasMoreChapters(): Boolean = select("button").any {
+		it.text().contains("load more chapters", ignoreCase = true)
+	} || select("*").any { element ->
+		element.attributes().any { attribute ->
+			attribute.key.endsWith("click") && attribute.value.contains("loadMoreChapters")
 		}
 	}
 
@@ -770,6 +889,42 @@ internal abstract class OniSagaParser(
 		cache[key] = CachedLivewireState(state, System.currentTimeMillis())
 	}
 
+	private fun getMangaListLock(key: String): Mutex = synchronized(MANGA_LIST_LOCKS) {
+		MANGA_LIST_LOCKS.getOrPut(key, ::Mutex)
+	}
+
+	private fun getCachedMangaList(key: String): List<Manga>? = synchronized(MANGA_LISTS) {
+		val cached = MANGA_LISTS[key] ?: return@synchronized null
+		if (System.currentTimeMillis() - cached.createdAt > MANGA_LIST_CACHE_TTL) {
+			MANGA_LISTS.remove(key)
+			null
+		} else {
+			cached.manga
+		}
+	}
+
+	private fun cacheMangaList(key: String, manga: List<Manga>) = synchronized(MANGA_LISTS) {
+		MANGA_LISTS[key] = CachedMangaList(manga, System.currentTimeMillis())
+	}
+
+	private fun getMangaDetailsLock(key: String): Mutex = synchronized(MANGA_DETAILS_LOCKS) {
+		MANGA_DETAILS_LOCKS.getOrPut(key, ::Mutex)
+	}
+
+	private fun getCachedMangaDetails(key: String): Manga? = synchronized(MANGA_DETAILS) {
+		val cached = MANGA_DETAILS[key] ?: return@synchronized null
+		if (System.currentTimeMillis() - cached.createdAt > MANGA_DETAILS_CACHE_TTL) {
+			MANGA_DETAILS.remove(key)
+			null
+		} else {
+			cached.manga
+		}
+	}
+
+	private fun cacheMangaDetails(key: String, manga: Manga) = synchronized(MANGA_DETAILS) {
+		MANGA_DETAILS[key] = CachedMangaDetails(manga, System.currentTimeMillis())
+	}
+
 	private fun JSONObject.firstComponent(): JSONObject? = optJSONArray("components")?.optJSONObject(0)
 
 	private fun MangaListFilter.toLivewireUpdates(order: SortOrder): LivewireUpdates {
@@ -814,6 +969,8 @@ internal abstract class OniSagaParser(
 	private data class LivewireState(val snapshot: String, val token: String)
 	private data class LivewirePage(val document: Document, val state: LivewireState)
 	private data class CachedLivewireState(val state: LivewireState, val createdAt: Long)
+	private data class CachedMangaList(val manga: List<Manga>, val createdAt: Long)
+	private data class CachedMangaDetails(val manga: Manga, val createdAt: Long)
 	private data class CachedPageUrl(val url: String, val expiresAt: Long)
 	private data class ReaderState(val token: String, val orders: List<Int>)
 	private data class CachedReaderState(val state: ReaderState, val expiresAt: Long)
@@ -851,6 +1008,24 @@ internal abstract class OniSagaParser(
 			releaseEnd == null &&
 			genres.isEmpty() &&
 			excludedGenres.isEmpty()
+
+		fun toTopMangaUrl(domain: String, page: Int): String? {
+			if (
+				platform.isNotEmpty() || status.isNotEmpty() || minimumChapters.isNotEmpty() || group != null ||
+				releaseStart != null || releaseEnd != null || genres.isNotEmpty() || excludedGenres.isNotEmpty()
+			) {
+				return null
+			}
+			val topSort = when (sort) {
+				"view" -> null
+				"vote_average" -> "rated"
+				else -> return null
+			}
+			return "https://$domain/top-manga".toHttpUrl().newBuilder().apply {
+				if (page > 1) addQueryParameter("page", page.toString())
+				if (topSort != null) addQueryParameter("sort", topSort)
+			}.build().toString()
+		}
 
 		fun toJson(): JSONObject = JSONObject()
 			.put("platform", platform)
@@ -907,6 +1082,10 @@ internal abstract class OniSagaParser(
 		const val READER_UNAVAILABLE_CACHE_TTL_MILLIS = 30_000L
 		const val LIST_STATE_CACHE_SIZE = 12
 		const val LIST_STATE_CACHE_TTL = 15 * 60_000L
+		const val MANGA_LIST_CACHE_SIZE = 32
+		const val MANGA_LIST_CACHE_TTL = 60_000L
+		const val MANGA_DETAILS_CACHE_SIZE = 32
+		const val MANGA_DETAILS_CACHE_TTL = 60_000L
 		const val IMAGE_REFERER_FRAGMENT = "onisaga-ref:"
 		const val POST_FILTER_COMPONENT = "post-filter"
 		const val CHAPTER_LIST_COMPONENT = "manga.chapter-list"
@@ -968,12 +1147,36 @@ internal abstract class OniSagaParser(
 					eldest: MutableMap.MutableEntry<String, CachedLivewireState>?,
 				): Boolean = size > LIST_STATE_CACHE_SIZE
 			}
+		val MANGA_LISTS = object : LinkedHashMap<String, CachedMangaList>(MANGA_LIST_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedMangaList>?): Boolean =
+				size > MANGA_LIST_CACHE_SIZE
+		}
+		val MANGA_LIST_LOCKS = object : LinkedHashMap<String, Mutex>(MANGA_LIST_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
+				size > MANGA_LIST_CACHE_SIZE
+		}
+		val MANGA_DETAILS = object :
+			LinkedHashMap<String, CachedMangaDetails>(MANGA_DETAILS_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedMangaDetails>?): Boolean =
+				size > MANGA_DETAILS_CACHE_SIZE
+		}
+		val MANGA_DETAILS_LOCKS = object : LinkedHashMap<String, Mutex>(MANGA_DETAILS_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
+				size > MANGA_DETAILS_CACHE_SIZE
+		}
 		val READER_TOKEN_REGEX = Regex("""readerToken["']?\s*:\s*["']([^"']+)["']""")
 		val READER_TOKEN_CANDIDATE_REGEX = Regex("""[A-Za-z0-9+/]{80,}={0,2}""")
 		val PAGE_ORDER_REGEX = Regex("""["']?order["']?\s*:\s*(\d+)""")
 		val CHAPTER_NUMBER_REGEX = Regex("""(?:Chapter\s+)?([\d.]+)""", RegexOption.IGNORE_CASE)
 		val RELATIVE_DATE_REGEX = Regex("""(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago""")
 		val RATING_REGEX = Regex("""(\d+(?:\.\d+)?)""")
+		val RANKED_TITLE_REGEX = Regex(
+			"""^\d+\s+(.+?)\s+(?:Ongoing|Completed|Hiatus|Releasing|Cancelled)\b""",
+			RegexOption.IGNORE_CASE,
+		)
+		val CHAPTER_LANGUAGE_REGEX = Regex(
+			"""(?:^|[\s·])(PT-BR|ES-LA|EN|FR|JA|PT|ES)(?=$|[\s·])""",
+		)
 		val INTERPUNCT_REGEX = Regex("""\s*·\s*""")
 
 		val GENRES = """
