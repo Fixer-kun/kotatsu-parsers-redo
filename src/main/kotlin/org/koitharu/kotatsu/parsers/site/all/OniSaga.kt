@@ -547,13 +547,12 @@ internal abstract class OniSagaParser(
 
 	private suspend fun loadReaderToken(chapterUrl: String): String {
 		return getReaderChapterLock(chapterUrl).withLock {
-			getReaderToken(chapterUrl) ?: loadReaderState(chapterUrl).token
+			getReaderToken(chapterUrl) ?: loadReaderState(chapterUrl).token.nullIfEmpty()
+				?: throw ParseException("Could not refresh reader token", chapterUrl)
 		}
 	}
 
 	private suspend fun loadReaderState(chapterUrl: String): ReaderState {
-		var tokenMissing = false
-		var pagesMissing = false
 		repeat(READER_RETRIES) { attempt ->
 			try {
 				val body = webClient.httpGet(chapterUrl).parseRaw()
@@ -563,8 +562,6 @@ internal abstract class OniSagaParser(
 					.distinct()
 					.sorted()
 					.toList()
-				tokenMissing = token == null
-				pagesMissing = orders.isEmpty()
 				if (token != null && orders.isNotEmpty()) {
 					putReaderToken(chapterUrl, token)
 					return ReaderState(token, orders).also { cacheReaderState(chapterUrl, it) }
@@ -578,12 +575,9 @@ internal abstract class OniSagaParser(
 				}
 			}
 		}
-		val message = when {
-			tokenMissing -> "Could not find reader token"
-			pagesMissing -> "Could not find reader pages"
-			else -> "Could not initialize reader"
+		return ReaderState("", emptyList()).also {
+			cacheReaderState(chapterUrl, it, READER_UNAVAILABLE_CACHE_TTL_MILLIS)
 		}
-		throw ParseException(message, chapterUrl)
 	}
 
 	private fun getReaderToken(chapterUrl: String): String? = synchronized(readerTokens) {
@@ -612,10 +606,14 @@ internal abstract class OniSagaParser(
 		}
 	}
 
-	private fun cacheReaderState(chapterUrl: String, state: ReaderState) = synchronized(readerChapterStates) {
+	private fun cacheReaderState(
+		chapterUrl: String,
+		state: ReaderState,
+		ttlMillis: Long = READER_STATE_CACHE_TTL_MILLIS,
+	) = synchronized(readerChapterStates) {
 		readerChapterStates[chapterUrl] = CachedReaderState(
 			state = state,
-			expiresAt = System.currentTimeMillis() + READER_STATE_CACHE_TTL_MILLIS,
+			expiresAt = System.currentTimeMillis() + ttlMillis,
 		)
 	}
 
@@ -930,6 +928,7 @@ internal abstract class OniSagaParser(
 		const val READER_PAGE_CACHE_TTL_MILLIS = 10 * 60_000L
 		const val READER_PAGE_EXPIRY_MARGIN_MILLIS = 30_000L
 		const val READER_STATE_CACHE_TTL_MILLIS = 10 * 60_000L
+		const val READER_UNAVAILABLE_CACHE_TTL_MILLIS = 30_000L
 		const val LIST_STATE_CACHE_SIZE = 12
 		const val LIST_STATE_CACHE_TTL = 15 * 60_000L
 		const val IMAGE_REFERER_FRAGMENT = "onisaga-ref:"
