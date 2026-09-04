@@ -57,41 +57,6 @@ internal abstract class OniSagaParser(
 		isYearSupported = true,
 	)
 
-	private val readerSignRateLock = Mutex()
-
-	@Volatile
-	private var lastReaderSignRequestStartedAt = 0L
-
-	@Volatile
-	private var readerSignBackoffUntil = 0L
-
-	private val readerTokens = object : LinkedHashMap<String, String>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
-			size > READER_TOKEN_CACHE_SIZE
-	}
-
-	private val readerPageUrls =
-		object : LinkedHashMap<String, CachedPageUrl>(READER_PAGE_CACHE_SIZE, 0.75f, true) {
-			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedPageUrl>?): Boolean =
-				size > READER_PAGE_CACHE_SIZE
-		}
-
-	private val readerPageLocks = object : LinkedHashMap<String, Mutex>(READER_PAGE_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
-			size > READER_PAGE_CACHE_SIZE
-	}
-
-	private val readerChapterStates =
-		object : LinkedHashMap<String, CachedReaderState>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
-			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedReaderState>?): Boolean =
-				size > READER_TOKEN_CACHE_SIZE
-		}
-
-	private val readerChapterLocks = object : LinkedHashMap<String, Mutex>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
-			size > READER_TOKEN_CACHE_SIZE
-	}
-
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
@@ -514,10 +479,12 @@ internal abstract class OniSagaParser(
 						shouldRefreshToken = true
 					}
 					429 -> {
-						readerSignBackoffUntil = maxOf(
-							readerSignBackoffUntil,
-							System.currentTimeMillis() + READER_429_BACKOFF_MILLIS,
-						)
+						synchronized(readerSignStateLock) {
+							readerSignBackoffUntil = maxOf(
+								readerSignBackoffUntil,
+								System.currentTimeMillis() + READER_429_BACKOFF_MILLIS,
+							)
+						}
 					}
 					else -> throw error
 				}
@@ -536,13 +503,20 @@ internal abstract class OniSagaParser(
 	}
 
 	private suspend fun awaitReaderSignRequestSlot() = readerSignRateLock.withLock {
-		val now = System.currentTimeMillis()
-		val nextStart = maxOf(
-			lastReaderSignRequestStartedAt + READER_SIGN_REQUEST_INTERVAL_MILLIS,
-			readerSignBackoffUntil,
-		)
-		if (nextStart > now) delay(nextStart - now)
-		lastReaderSignRequestStartedAt = System.currentTimeMillis()
+		while (true) {
+			val now = System.currentTimeMillis()
+			val delayMillis = synchronized(readerSignStateLock) {
+				maxOf(
+					lastReaderSignRequestStartedAt + READER_SIGN_REQUEST_INTERVAL_MILLIS,
+					readerSignBackoffUntil,
+				) - now
+			}
+			if (delayMillis <= 0L) break
+			delay(delayMillis)
+		}
+		synchronized(readerSignStateLock) {
+			lastReaderSignRequestStartedAt = System.currentTimeMillis()
+		}
 	}
 
 	private suspend fun loadReaderToken(chapterUrl: String): String {
@@ -619,10 +593,12 @@ internal abstract class OniSagaParser(
 
 	private fun registerReaderSignBackoff(error: TooManyRequestExceptions) {
 		val retryDelay = readerRetryDelay(error)
-		readerSignBackoffUntil = maxOf(
-			readerSignBackoffUntil,
-			System.currentTimeMillis() + retryDelay,
-		)
+		synchronized(readerSignStateLock) {
+			readerSignBackoffUntil = maxOf(
+				readerSignBackoffUntil,
+				System.currentTimeMillis() + retryDelay,
+			)
+		}
 	}
 
 	private fun readerRetryDelay(error: TooManyRequestExceptions): Long =
@@ -941,6 +917,42 @@ internal abstract class OniSagaParser(
 		const val WEEK_MILLIS = 604_800_000L
 		const val MONTH_MILLIS = 2_592_000_000L
 		const val YEAR_MILLIS = 31_536_000_000L
+
+		val readerSignRateLock = Mutex()
+		val readerSignStateLock = Any()
+
+		@Volatile
+		var lastReaderSignRequestStartedAt = 0L
+
+		@Volatile
+		var readerSignBackoffUntil = 0L
+
+		val readerTokens = object : LinkedHashMap<String, String>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+				size > READER_TOKEN_CACHE_SIZE
+		}
+
+		val readerPageUrls =
+			object : LinkedHashMap<String, CachedPageUrl>(READER_PAGE_CACHE_SIZE, 0.75f, true) {
+				override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedPageUrl>?): Boolean =
+					size > READER_PAGE_CACHE_SIZE
+			}
+
+		val readerPageLocks = object : LinkedHashMap<String, Mutex>(READER_PAGE_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
+				size > READER_PAGE_CACHE_SIZE
+		}
+
+		val readerChapterStates =
+			object : LinkedHashMap<String, CachedReaderState>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
+				override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedReaderState>?): Boolean =
+					size > READER_TOKEN_CACHE_SIZE
+			}
+
+		val readerChapterLocks = object : LinkedHashMap<String, Mutex>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
+				size > READER_TOKEN_CACHE_SIZE
+		}
 
 		val IMAGE_ATTRIBUTES = arrayOf("data-src", "data-lazy-src", "src")
 		val LANGUAGE_CODES = listOf("EN", "FR", "JA", "PT-BR", "PT", "ES-LA", "ES")
