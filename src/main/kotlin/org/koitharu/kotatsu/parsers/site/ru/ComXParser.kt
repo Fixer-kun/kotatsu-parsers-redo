@@ -278,7 +278,9 @@ internal class ComXParser(context: MangaLoaderContext) :
 		for (index in array.length() - 1 downTo 0) {
 			val chapter = array.getJSONObject(index)
 			val chapterId = chapter.getLong("id")
-			val title = chapter.getStringOrNull("title")?.let { WHITESPACES_REGEX.replace(it, " ").trim() }
+			val title = chapter.getStringOrNull("title")?.let {
+				CHAPTER_TITLE_PREFIX_REGEX.replace(WHITESPACES_REGEX.replace(it, " ").trim(), "").trim()
+			}
 			val siteNumber = chapter.getFloatOrDefault(
 				"number",
 				chapter.getFloatOrDefault("posi", 0f),
@@ -312,7 +314,7 @@ internal class ComXParser(context: MangaLoaderContext) :
 			)
 			counter = number
 		}
-		return result.asReversed()
+		return result
 	}
 
 	private fun isExtraChapter(title: String?): Boolean {
@@ -456,6 +458,7 @@ internal class ComXParser(context: MangaLoaderContext) :
 			RegexOption.IGNORE_CASE,
 		)
 		private val CHAPTER_ANY_NUMBER_REGEX = Regex("""([\d.]+)""")
+		private val CHAPTER_TITLE_PREFIX_REGEX = Regex("""^1\s*-\s*""")
 		private val NO_INFO_EXTRA_REGEX = Regex("""#\s?1(?!\d|\.\d)""")
 		private val WHITESPACES_REGEX = Regex("""\s{2,}""")
 		private val EXTRA_CHAPTER_WORDS = arrayOf(

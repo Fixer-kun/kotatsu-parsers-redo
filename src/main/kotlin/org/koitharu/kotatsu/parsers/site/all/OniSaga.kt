@@ -61,17 +61,9 @@ internal abstract class OniSagaParser(
 	@Volatile
 	private var lastReaderRequestTime = 0L
 
-	@Volatile
-	private var currentReaderToken = ""
-
-	private val initialListStates = object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedLivewireState>?): Boolean =
-			size > LIST_STATE_CACHE_SIZE
-	}
-
-	private val activeListStates = object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedLivewireState>?): Boolean =
-			size > LIST_STATE_CACHE_SIZE
+	private val readerTokens = object : LinkedHashMap<String, String>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
+			size > READER_TOKEN_CACHE_SIZE
 	}
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -149,21 +141,21 @@ internal abstract class OniSagaParser(
 		val updates = filter.toLivewireUpdates(order)
 		val stateKey = "$pageUrl\n${updates.cacheKey()}"
 		val directPage = page == 1 && updates.isDefault()
-		var initialState = getCachedState(initialListStates, pageUrl)
+		var initialState = getCachedState(INITIAL_LIST_STATES, pageUrl)
 		var initialDocument: Document? = null
 		if (directPage || initialState == null) {
 			initialDocument = webClient.httpGet(pageUrl).parseHtml()
 			initialState = initialDocument.extractLivewireState(POST_FILTER_COMPONENT)
-			if (initialState != null) cacheState(initialListStates, pageUrl, initialState)
+			if (initialState != null) cacheState(INITIAL_LIST_STATES, pageUrl, initialState)
 		}
 		val document = if (directPage) {
 			checkNotNull(initialDocument)
 		} else {
-			val state = getCachedState(activeListStates, stateKey)
+			val state = getCachedState(ACTIVE_LIST_STATES, stateKey)
 				?: initialState
 				?: throw ParseException("Could not find Livewire browse state", pageUrl)
 			val result = fetchLivewirePage(pageUrl, state, page, updates)
-			cacheState(activeListStates, stateKey, result.state)
+			cacheState(ACTIVE_LIST_STATES, stateKey, result.state)
 			result.document
 		}
 		val contentRating = filter.contentRating.oneOrThrowIfMany()
@@ -311,7 +303,7 @@ internal abstract class OniSagaParser(
 		code: String,
 	): List<MangaChapter> {
 		var snapshot = initialState.snapshot
-		var previousSize = -1
+		var previousSize = 0
 		var chapters = emptyList<MangaChapter>()
 		repeat(MAX_CHAPTER_REQUESTS) {
 			val response = webClient.httpPost(
@@ -433,8 +425,9 @@ internal abstract class OniSagaParser(
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
 		val body = webClient.httpGet(chapterUrl).parseRaw()
-		currentReaderToken = READER_TOKEN_REGEX.find(body)?.groupValues?.get(1)?.nullIfEmpty()
+		val token = READER_TOKEN_REGEX.find(body)?.groupValues?.get(1)?.nullIfEmpty()
 			?: throw ParseException("Could not find reader token", chapterUrl)
+		putReaderToken(chapterUrl, token)
 		val orders = PAGE_ORDER_REGEX.findAll(body)
 			.mapNotNull { it.groupValues[1].toIntOrNull() }
 			.distinct()
@@ -459,38 +452,47 @@ internal abstract class OniSagaParser(
 		val chapterId = chapterUrl.toHttpUrl().pathSegments.lastOrNull()?.nullIfEmpty()
 			?: throw ParseException("Invalid chapter URL", chapterUrl)
 		val apiUrl = "https://$domain/api/chapter/$chapterId/page/$order"
-		var token = currentReaderToken.nullIfEmpty() ?: loadReaderToken(chapterUrl)
 		repeat(READER_RETRIES) {
-			readerRateLock.withLock {
-				val remaining = READER_DELAY_MILLIS - (System.currentTimeMillis() - lastReaderRequestTime)
-				if (remaining > 0L) delay(remaining)
-				currentReaderToken.nullIfEmpty()?.let { token = it }
-				lastReaderRequestTime = System.currentTimeMillis()
-			}
-			val response = try {
-				webClient.httpGet(apiUrl, readerHeaders(token, chapterUrl))
-			} catch (error: HttpStatusException) {
-				if (error.statusCode == 429) {
-					delay(READER_DELAY_MILLIS)
-					return@repeat
+			var shouldRefreshToken = false
+			val imageUrl = try {
+				readerRateLock.withLock {
+					val remaining = READER_DELAY_MILLIS - (System.currentTimeMillis() - lastReaderRequestTime)
+					if (remaining > 0L) delay(remaining)
+					val token = getReaderToken(chapterUrl) ?: loadReaderToken(chapterUrl)
+					try {
+						val response = webClient.httpGet(apiUrl, readerHeaders(token, chapterUrl))
+						response.header("x-reader-token-next")?.nullIfEmpty()?.let {
+							putReaderToken(chapterUrl, it)
+						}
+						val json = response.parseJson()
+						json.getStringOrNull("url")?.toAbsoluteUrl(domain)?.let { return@withLock it }
+						val message = json.getStringOrNull("message")
+						if (message?.contains("token", ignoreCase = true) == true) {
+							removeReaderToken(chapterUrl)
+							shouldRefreshToken = true
+							return@withLock null
+						}
+						throw ParseException(message ?: "Reader API error", apiUrl)
+					} finally {
+						lastReaderRequestTime = System.currentTimeMillis()
+					}
 				}
-				throw error
+			} catch (error: HttpStatusException) {
+				when (error.statusCode) {
+					401, 403 -> {
+						removeReaderToken(chapterUrl)
+						shouldRefreshToken = true
+					}
+					429 -> delay(READER_DELAY_MILLIS)
+					else -> throw error
+				}
+				null
 			}
-			response.header("x-reader-token-next")?.nullIfEmpty()?.let {
-				currentReaderToken = it
-				token = it
-			}
-			val json = response.parseJson()
-			json.getStringOrNull("url")?.let { imageUrl ->
-				val absoluteUrl = imageUrl.toAbsoluteUrl(domain)
+			if (imageUrl != null) {
 				val encodedReferer = context.encodeBase64(chapterUrl.toByteArray(Charsets.UTF_8))
-				return "${absoluteUrl.substringBefore('#')}#$IMAGE_REFERER_FRAGMENT$encodedReferer"
+				return "${imageUrl.substringBefore('#')}#$IMAGE_REFERER_FRAGMENT$encodedReferer"
 			}
-			if (json.getStringOrNull("message")?.contains("expired", ignoreCase = true) == true) {
-				token = loadReaderToken(chapterUrl)
-				return@repeat
-			}
-			throw ParseException(json.getStringOrNull("message") ?: "Reader API error", apiUrl)
+			if (shouldRefreshToken) loadReaderToken(chapterUrl)
 		}
 		throw ParseException("Failed to fetch image after $READER_RETRIES attempts", apiUrl)
 	}
@@ -498,8 +500,20 @@ internal abstract class OniSagaParser(
 	private suspend fun loadReaderToken(chapterUrl: String): String {
 		val body = webClient.httpGet(chapterUrl).parseRaw()
 		return READER_TOKEN_REGEX.find(body)?.groupValues?.get(1)?.nullIfEmpty()?.also {
-			currentReaderToken = it
+			putReaderToken(chapterUrl, it)
 		} ?: throw ParseException("Could not refresh reader token", chapterUrl)
+	}
+
+	private fun getReaderToken(chapterUrl: String): String? = synchronized(readerTokens) {
+		readerTokens[chapterUrl]
+	}
+
+	private fun putReaderToken(chapterUrl: String, token: String) = synchronized(readerTokens) {
+		readerTokens[chapterUrl] = token
+	}
+
+	private fun removeReaderToken(chapterUrl: String) = synchronized(readerTokens) {
+		readerTokens.remove(chapterUrl)
 	}
 
 	private fun readerHeaders(token: String, referer: String): Headers = getRequestHeaders().newBuilder()
@@ -750,12 +764,13 @@ internal abstract class OniSagaParser(
 
 	private companion object {
 		const val PAGE_SIZE = 24
-		const val CHAPTER_LOAD_BATCH = 4
-		const val MAX_CHAPTER_REQUESTS = 25
+		const val CHAPTER_LOAD_BATCH = 10
+		const val MAX_CHAPTER_REQUESTS = 10
 		const val READER_RETRIES = 3
 		const val READER_DELAY_MILLIS = 2_000L
+		const val READER_TOKEN_CACHE_SIZE = 16
 		const val LIST_STATE_CACHE_SIZE = 12
-		const val LIST_STATE_CACHE_TTL = 5 * 60_000L
+		const val LIST_STATE_CACHE_TTL = 15 * 60_000L
 		const val IMAGE_REFERER_FRAGMENT = "onisaga-ref:"
 		const val POST_FILTER_COMPONENT = "post-filter"
 		const val CHAPTER_LIST_COMPONENT = "manga.chapter-list"
@@ -769,6 +784,18 @@ internal abstract class OniSagaParser(
 
 		val IMAGE_ATTRIBUTES = arrayOf("data-src", "data-lazy-src", "src")
 		val LANGUAGE_CODES = listOf("EN", "FR", "JA", "PT-BR", "PT", "ES-LA", "ES")
+		val INITIAL_LIST_STATES =
+			object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
+				override fun removeEldestEntry(
+					eldest: MutableMap.MutableEntry<String, CachedLivewireState>?,
+				): Boolean = size > LIST_STATE_CACHE_SIZE
+			}
+		val ACTIVE_LIST_STATES =
+			object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
+				override fun removeEldestEntry(
+					eldest: MutableMap.MutableEntry<String, CachedLivewireState>?,
+				): Boolean = size > LIST_STATE_CACHE_SIZE
+			}
 		val READER_TOKEN_REGEX = Regex("""readerToken["']?\s*:\s*["']([^"']+)["']""")
 		val PAGE_ORDER_REGEX = Regex("""["']?order["']?\s*:\s*(\d+)""")
 		val CHAPTER_NUMBER_REGEX = Regex("""(?:Chapter\s+)?([\d.]+)""", RegexOption.IGNORE_CASE)
