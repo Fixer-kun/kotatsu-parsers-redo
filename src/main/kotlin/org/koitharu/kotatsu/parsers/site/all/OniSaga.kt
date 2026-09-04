@@ -1,8 +1,5 @@
 package org.koitharu.kotatsu.parsers.site.all
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -350,28 +347,26 @@ internal abstract class OniSagaParser(
 		}
 	}
 
-	private suspend fun fetchChapters(document: Document): List<MangaChapter> = coroutineScope {
-		val languages = languageCode?.let(::listOf) ?: LANGUAGE_CODES
+	private suspend fun fetchChapters(document: Document): List<MangaChapter> {
 		val state = document.extractLivewireState(CHAPTER_LIST_COMPONENT)
 		val visibleLanguages = document.select("a[href*='/read/']")
 			.mapNotNullTo(linkedSetOf()) { it.chapterLanguage() }
 		val selectedLanguage = state?.selectedChapterLanguage() ?: visibleLanguages.singleOrNull()
-		val initialChapters = languages.associateWith { code ->
-			parseChapters(document, code, matchLanguage = selectedLanguage != code)
+		val initialChapters = if (languageCode == null) {
+			parseAllLanguageChapters(document, state?.activeChapterLanguage() ?: selectedLanguage)
+		} else {
+			parseChapters(
+				document = document,
+				language = languageCode,
+				matchLanguage = selectedLanguage != languageCode,
+			)
 		}
-		val parsedInitial = normalizeChapters(initialChapters.values.flatten())
-		state ?: return@coroutineScope parsedInitial
-		if (parsedInitial.isNotEmpty() && !document.hasMoreChapters()) {
-			return@coroutineScope parsedInitial
+		if (state == null || initialChapters.isNotEmpty() && !document.hasMoreChapters()) {
+			return initialChapters
 		}
-		languages.map { code ->
-			async {
-				val fallback = initialChapters.getValue(code)
-				runCatchingCancellable {
-					fetchLanguageChapters(document.location(), state, code, fallback)
-				}.getOrElse { fallback }
-			}
-		}.awaitAll().flatten().let(::normalizeChapters)
+		return runCatchingCancellable {
+			fetchChapterBatch(document.location(), state, languageCode, initialChapters)
+		}.getOrElse { initialChapters }
 	}
 
 	private fun normalizeChapters(chapters: List<MangaChapter>): List<MangaChapter> = chapters
@@ -381,10 +376,10 @@ internal abstract class OniSagaParser(
 		.sortedByDescending(List<MangaChapter>::size)
 		.flatMap { branch -> branch.sortedBy(MangaChapter::number) }
 
-	private suspend fun fetchLanguageChapters(
+	private suspend fun fetchChapterBatch(
 		referer: String,
 		initialState: LivewireState,
-		code: String,
+		code: String?,
 		fallback: List<MangaChapter>,
 	): List<MangaChapter> {
 		var snapshot = initialState.snapshot
@@ -395,7 +390,7 @@ internal abstract class OniSagaParser(
 				"https://$domain/livewire/update".toHttpUrl(),
 				createLivewirePayload(
 					state = LivewireState(snapshot, initialState.token),
-					updates = JSONObject().put("language", code),
+					updates = JSONObject().put("language", code ?: JSONObject.NULL),
 					method = "loadMoreChapters",
 					params = JSONArray(),
 					callCount = CHAPTER_LOAD_BATCH,
@@ -405,12 +400,23 @@ internal abstract class OniSagaParser(
 			val component = response.firstComponent() ?: return chapters
 			val html = component.optJSONObject("effects")?.getStringOrNull("html") ?: return chapters
 			val chapterDocument = Jsoup.parseBodyFragment(html, "https://$domain")
-			val parsed = parseChapters(chapterDocument, code)
+			val nextSnapshot = component.getStringOrNull("snapshot")
+			val parsed = if (code == null) {
+				parseAllLanguageChapters(
+					chapterDocument,
+					nextSnapshot
+						?.let { LivewireState(it, initialState.token) }
+						?.activeChapterLanguage()
+						?: initialState.activeChapterLanguage(),
+				)
+			} else {
+				parseChapters(chapterDocument, code)
+			}
 			if (parsed.size <= previousSize) return chapters
 			chapters = parsed
 			previousSize = parsed.size
 			if (!chapterDocument.hasMoreChapters()) return chapters
-			snapshot = component.getStringOrNull("snapshot") ?: return chapters
+			snapshot = nextSnapshot ?: return chapters
 		}
 		return chapters
 	}
@@ -419,11 +425,18 @@ internal abstract class OniSagaParser(
 		document: Document,
 		language: String,
 		matchLanguage: Boolean = false,
+		includeUnlabeled: Boolean = false,
 	): List<MangaChapter> {
 		val raw = ArrayList<RawChapter>()
 		document.select("a.gap-4:has(div[data-flux-heading])").forEach { element ->
 			val url = element.attrAsRelativeUrlOrNull("href")?.takeIf { "/read/" in it } ?: return@forEach
-			if (matchLanguage && element.chapterLanguage() != language) return@forEach
+			val chapterLanguage = element.chapterLanguage()
+			if (
+				matchLanguage && chapterLanguage != language &&
+				!(includeUnlabeled && chapterLanguage == null)
+			) {
+				return@forEach
+			}
 			raw.add(
 				RawChapter(
 					number = element.chapterNumber() ?: return@forEach,
@@ -440,7 +453,13 @@ internal abstract class OniSagaParser(
 			var unknownIndex = 1
 			dropdown.select("ui-menu a[data-flux-menu-item]").forEach { link ->
 				val url = link.attrAsRelativeUrlOrNull("href")?.takeIf { "/read/" in it } ?: return@forEach
-				if (matchLanguage && link.chapterLanguage() != language) return@forEach
+				val chapterLanguage = link.chapterLanguage()
+				if (
+					matchLanguage && chapterLanguage != language &&
+					!(includeUnlabeled && chapterLanguage == null)
+				) {
+					return@forEach
+				}
 				val groupText = (
 					link.selectFirst("span.text-sm")?.text()
 						?: link.selectFirst("div.flex.items-center.gap-2 > span:not(.ml-auto)")?.text()
@@ -481,6 +500,18 @@ internal abstract class OniSagaParser(
 		}
 	}
 
+	private fun parseAllLanguageChapters(document: Document, unlabeledLanguage: String?): List<MangaChapter> {
+		val fallbackLanguage = unlabeledLanguage ?: DEFAULT_CHAPTER_LANGUAGE
+		return LANGUAGE_CODES.flatMap { code ->
+			parseChapters(
+				document = document,
+				language = code,
+				matchLanguage = true,
+				includeUnlabeled = code == fallbackLanguage,
+			)
+		}.let(::normalizeChapters)
+	}
+
 	private fun Element.chapterLanguage(): String? =
 		CHAPTER_LANGUAGE_REGEX.find(text())?.groupValues?.get(1)
 
@@ -491,6 +522,15 @@ internal abstract class OniSagaParser(
 			is JSONArray -> value.optString(0)
 			else -> null
 		}?.takeIf(LANGUAGE_CODES::contains)
+	}.getOrNull()
+
+	private fun LivewireState.activeChapterLanguage(): String? = runCatchingCancellable {
+		JSONObject(snapshot)
+			.optJSONObject("data")
+			?.optString("activeLanguage")
+			?.replace('_', '-')
+			?.uppercase(Locale.ROOT)
+			?.takeIf(LANGUAGE_CODES::contains)
 	}.getOrNull()
 
 	private fun Document.hasMoreChapters(): Boolean = select("button").any {
@@ -1067,7 +1107,7 @@ internal abstract class OniSagaParser(
 
 	private companion object {
 		const val PAGE_SIZE = 24
-		const val CHAPTER_LOAD_BATCH = 10
+		const val CHAPTER_LOAD_BATCH = 100
 		const val MAX_CHAPTER_REQUESTS = 10
 		const val READER_RETRIES = 3
 		const val READER_SIGN_REQUEST_INTERVAL_MILLIS = 250L
@@ -1090,6 +1130,7 @@ internal abstract class OniSagaParser(
 		const val POST_FILTER_COMPONENT = "post-filter"
 		const val CHAPTER_LIST_COMPONENT = "manga.chapter-list"
 		const val DEFAULT_GROUP = "Default"
+		const val DEFAULT_CHAPTER_LANGUAGE = "EN"
 		const val MINUTE_MILLIS = 60_000L
 		const val HOUR_MILLIS = 3_600_000L
 		const val DAY_MILLIS = 86_400_000L
