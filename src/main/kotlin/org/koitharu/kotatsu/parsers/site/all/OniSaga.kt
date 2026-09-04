@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -63,9 +64,14 @@ internal abstract class OniSagaParser(
 	@Volatile
 	private var currentReaderToken = ""
 
-	private val imageReferers = object : LinkedHashMap<String, String>(IMAGE_REFERER_CACHE_SIZE, 0.75f, true) {
-		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
-			size > IMAGE_REFERER_CACHE_SIZE
+	private val initialListStates = object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedLivewireState>?): Boolean =
+			size > LIST_STATE_CACHE_SIZE
+	}
+
+	private val activeListStates = object : LinkedHashMap<String, CachedLivewireState>(LIST_STATE_CACHE_SIZE, 0.75f, true) {
+		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedLivewireState>?): Boolean =
+			size > LIST_STATE_CACHE_SIZE
 	}
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
@@ -80,10 +86,32 @@ internal abstract class OniSagaParser(
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		val request = chain.request()
-		val referer = synchronized(imageReferers) { imageReferers[request.url.toString()] }
-		return chain.proceed(
-			referer?.let { request.newBuilder().header("Referer", it).build() } ?: request,
-		)
+		val originalUrl = unwrapImageProxy(request.url)
+		val encodedReferer = originalUrl.fragment
+			?.takeIf { it.startsWith(IMAGE_REFERER_FRAGMENT) }
+			?.removePrefix(IMAGE_REFERER_FRAGMENT)
+		val referer = encodedReferer?.let {
+			runCatching { context.decodeBase64(it).toString(Charsets.UTF_8) }.getOrNull()
+		}
+		val imageRequest = if (referer == null) {
+			request
+		} else {
+			request.newBuilder()
+				.url(originalUrl.newBuilder().fragment(null).build())
+				.header("Referer", referer)
+				.build()
+		}
+		return chain.proceed(imageRequest)
+	}
+
+	private fun unwrapImageProxy(url: HttpUrl): HttpUrl = when (url.host) {
+		"wsrv.nl" -> url.queryParameter("url")?.toHttpUrlOrNull() ?: url
+		"v.recipes" -> url.toString()
+			.substringAfter("https://v.recipes/i/", "")
+			.takeIf(String::isNotEmpty)
+			?.toHttpUrlOrNull()
+			?: url
+		else -> url
 	}
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
@@ -119,11 +147,24 @@ internal abstract class OniSagaParser(
 				.toString()
 		}
 		val updates = filter.toLivewireUpdates(order)
-		val initialDocument = webClient.httpGet(pageUrl).parseHtml()
-		val document = if (page == 1 && updates.isDefault()) {
-			initialDocument
+		val stateKey = "$pageUrl\n${updates.cacheKey()}"
+		val directPage = page == 1 && updates.isDefault()
+		var initialState = getCachedState(initialListStates, pageUrl)
+		var initialDocument: Document? = null
+		if (directPage || initialState == null) {
+			initialDocument = webClient.httpGet(pageUrl).parseHtml()
+			initialState = initialDocument.extractLivewireState(POST_FILTER_COMPONENT)
+			if (initialState != null) cacheState(initialListStates, pageUrl, initialState)
+		}
+		val document = if (directPage) {
+			checkNotNull(initialDocument)
 		} else {
-			fetchLivewirePage(initialDocument, page, updates)
+			val state = getCachedState(activeListStates, stateKey)
+				?: initialState
+				?: throw ParseException("Could not find Livewire browse state", pageUrl)
+			val result = fetchLivewirePage(pageUrl, state, page, updates)
+			cacheState(activeListStates, stateKey, result.state)
+			result.document
 		}
 		val contentRating = filter.contentRating.oneOrThrowIfMany()
 		return parseMangaList(document).filter {
@@ -132,12 +173,11 @@ internal abstract class OniSagaParser(
 	}
 
 	private suspend fun fetchLivewirePage(
-		document: Document,
+		pageUrl: String,
+		state: LivewireState,
 		page: Int,
 		updates: LivewireUpdates,
-	): Document {
-		val state = document.extractLivewireState(POST_FILTER_COMPONENT)
-			?: throw ParseException("Could not find Livewire browse state", document.location())
+	): LivewirePage {
 		val payload = createLivewirePayload(
 			state = state,
 			updates = updates.toJson(),
@@ -147,13 +187,16 @@ internal abstract class OniSagaParser(
 		val response = webClient.httpPost(
 			"https://$domain/livewire/update".toHttpUrl(),
 			payload,
-			livewireHeaders(document.location()),
+			livewireHeaders(pageUrl),
 		).parseJson()
-		val html = response.firstComponent()
-			?.optJSONObject("effects")
+		val component = response.firstComponent()
+			?: throw ParseException("Empty Livewire browse response", pageUrl)
+		val html = component
+			.optJSONObject("effects")
 			?.getStringOrNull("html")
 			.orEmpty()
-		return Jsoup.parseBodyFragment(html, "https://$domain")
+		val nextState = component.getStringOrNull("snapshot")?.let { LivewireState(it, state.token) } ?: state
+		return LivewirePage(Jsoup.parseBodyFragment(html, "https://$domain"), nextState)
 	}
 
 	private fun parseMangaList(document: Document): List<Manga> =
@@ -270,7 +313,7 @@ internal abstract class OniSagaParser(
 		var snapshot = initialState.snapshot
 		var previousSize = -1
 		var chapters = emptyList<MangaChapter>()
-		repeat(MAX_CHAPTER_LOADS) {
+		repeat(MAX_CHAPTER_REQUESTS) {
 			val response = webClient.httpPost(
 				"https://$domain/livewire/update".toHttpUrl(),
 				createLivewirePayload(
@@ -278,6 +321,7 @@ internal abstract class OniSagaParser(
 					updates = JSONObject().put("language", code),
 					method = "loadMoreChapters",
 					params = JSONArray(),
+					callCount = CHAPTER_LOAD_BATCH,
 				),
 				livewireHeaders(referer),
 			).parseJson()
@@ -439,8 +483,8 @@ internal abstract class OniSagaParser(
 			val json = response.parseJson()
 			json.getStringOrNull("url")?.let { imageUrl ->
 				val absoluteUrl = imageUrl.toAbsoluteUrl(domain)
-				synchronized(imageReferers) { imageReferers[absoluteUrl] = chapterUrl }
-				return absoluteUrl
+				val encodedReferer = context.encodeBase64(chapterUrl.toByteArray(Charsets.UTF_8))
+				return "${absoluteUrl.substringBefore('#')}#$IMAGE_REFERER_FRAGMENT$encodedReferer"
 			}
 			if (json.getStringOrNull("message")?.contains("expired", ignoreCase = true) == true) {
 				token = loadReaderToken(chapterUrl)
@@ -543,6 +587,7 @@ internal abstract class OniSagaParser(
 		updates: JSONObject,
 		method: String,
 		params: JSONArray,
+		callCount: Int = 1,
 	): JSONObject = JSONObject()
 		.put("_token", state.token)
 		.put(
@@ -551,18 +596,40 @@ internal abstract class OniSagaParser(
 				JSONObject()
 					.put("snapshot", state.snapshot)
 					.put("updates", updates)
-					.put(
-						"calls",
-						JSONArray().put(
-							JSONObject()
-								.put("type", "call")
-								.put("path", "")
-								.put("method", method)
-								.put("params", params),
-						),
-					),
+					.put("calls", JSONArray().apply {
+						repeat(callCount) {
+							put(
+								JSONObject()
+									.put("type", "call")
+									.put("path", "")
+									.put("method", method)
+									.put("params", params),
+							)
+						}
+					}),
 			),
 		)
+
+	private fun getCachedState(
+		cache: MutableMap<String, CachedLivewireState>,
+		key: String,
+	): LivewireState? = synchronized(cache) {
+		val cached = cache[key] ?: return@synchronized null
+		if (System.currentTimeMillis() - cached.createdAt > LIST_STATE_CACHE_TTL) {
+			cache.remove(key)
+			null
+		} else {
+			cached.state
+		}
+	}
+
+	private fun cacheState(
+		cache: MutableMap<String, CachedLivewireState>,
+		key: String,
+		state: LivewireState,
+	) = synchronized(cache) {
+		cache[key] = CachedLivewireState(state, System.currentTimeMillis())
+	}
 
 	private fun JSONObject.firstComponent(): JSONObject? = optJSONArray("components")?.optJSONObject(0)
 
@@ -606,6 +673,8 @@ internal abstract class OniSagaParser(
 	}
 
 	private data class LivewireState(val snapshot: String, val token: String)
+	private data class LivewirePage(val document: Document, val state: LivewireState)
+	private data class CachedLivewireState(val state: LivewireState, val createdAt: Long)
 	private data class RawChapter(val number: Float, val url: String, val date: Long, val group: String?)
 
 	private data class LivewireUpdates(
@@ -619,6 +688,18 @@ internal abstract class OniSagaParser(
 		val genres: List<String> = emptyList(),
 		val excludedGenres: List<String> = emptyList(),
 	) {
+		fun cacheKey(): String = listOf(
+			platform,
+			status,
+			sort,
+			minimumChapters,
+			group.orEmpty(),
+			releaseStart.orEmpty(),
+			releaseEnd.orEmpty(),
+			genres.sorted().joinToString(","),
+			excludedGenres.sorted().joinToString(","),
+		).joinToString("|")
+
 		fun isDefault(): Boolean = platform.isEmpty() &&
 			status.isEmpty() &&
 			sort == "created_at" &&
@@ -669,10 +750,13 @@ internal abstract class OniSagaParser(
 
 	private companion object {
 		const val PAGE_SIZE = 24
-		const val MAX_CHAPTER_LOADS = 100
+		const val CHAPTER_LOAD_BATCH = 4
+		const val MAX_CHAPTER_REQUESTS = 25
 		const val READER_RETRIES = 3
 		const val READER_DELAY_MILLIS = 2_000L
-		const val IMAGE_REFERER_CACHE_SIZE = 256
+		const val LIST_STATE_CACHE_SIZE = 12
+		const val LIST_STATE_CACHE_TTL = 5 * 60_000L
+		const val IMAGE_REFERER_FRAGMENT = "onisaga-ref:"
 		const val POST_FILTER_COMPONENT = "post-filter"
 		const val CHAPTER_LIST_COMPONENT = "manga.chapter-list"
 		const val DEFAULT_GROUP = "Default"

@@ -298,6 +298,7 @@ internal class CuuTruyenParser(context: MangaLoaderContext) :
 				)
 			}
 			.distinctBy { it.url }
+			.asReversed()
 
 	private suspend fun resolveLegacyPath(manga: Manga): String {
 		if (!manga.url.startsWith(LEGACY_MANGA_PREFIX)) return manga.url

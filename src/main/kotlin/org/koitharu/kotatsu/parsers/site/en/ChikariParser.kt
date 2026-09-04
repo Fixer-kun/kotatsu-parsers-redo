@@ -241,13 +241,6 @@ internal class ChikariParser(context: MangaLoaderContext) :
 			val name = genre.getStringOrNull("name") ?: return@mapJSONNotNull null
 			MangaTag(slug, name, source)
 		}?.let(::addAll)
-
-		optJSONArray("tags")?.mapJSONNotNull { tag ->
-			if (tag.getBooleanOrDefault("is_spoiler", false)) return@mapJSONNotNull null
-			val id = tag.getStringOrNull("id") ?: return@mapJSONNotNull null
-			val name = tag.getStringOrNull("name") ?: return@mapJSONNotNull null
-			MangaTag("tag:$id", name, source)
-		}?.let(::addAll)
 	}
 
 	private fun JSONObject.toChapters(slug: String, multipleScans: Boolean): List<MangaChapter> {

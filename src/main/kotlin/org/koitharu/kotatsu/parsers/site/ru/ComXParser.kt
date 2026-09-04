@@ -58,9 +58,9 @@ internal class ComXParser(context: MangaLoaderContext) :
 		}
 
 		response.close()
-		val solveUrl = if (request.method == "GET") request.url.toString() else "https:///"
+		val solveUrl = if (request.method == "GET") request.url.toString() else "https://$domain/"
 		if (!solveDleGuard(solveUrl)) {
-			throw IOException("Open Com-X in WebView to bypass site protection")
+			throw IOException("Failed to bypass Com-X site protection automatically")
 		}
 		return chain.proceed(request)
 	}
@@ -80,11 +80,11 @@ internal class ComXParser(context: MangaLoaderContext) :
 		}.getOrNull()?.decodeWebViewString() ?: return@synchronized false
 
 		val trustCookie = result.split(';')
-			.firstOrNull { it.trim().startsWith("=") }
+			.firstOrNull { it.trim().startsWith("$DLE_TRUST_COOKIE=") }
 			?.trim()
 			?: return@synchronized false
 
-		context.cookieJar.insertCookies(domain, "; Path=/")
+		context.cookieJar.insertCookies(domain, "$trustCookie; Path=/")
 		lastGuardSolveAt = System.currentTimeMillis()
 		true
 	}
@@ -121,7 +121,11 @@ internal class ComXParser(context: MangaLoaderContext) :
 	override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
 		val doc = if (!filter.query.isNullOrBlank()) {
 			val query = filter.query.splitByWhitespace().joinToString("%20") { it.urlEncoded() }
-			val url = "/search//page//".toAbsoluteUrl(domain)
+			val url = buildString {
+				append("/search/").append(query)
+				if (page > 1) append("/page/").append(page)
+				append('/')
+			}.toAbsoluteUrl(domain)
 			webClient.httpGet(url, getRequestHeaders()).parseHtml()
 		} else {
 			val (sortBy, direction) = order.toSiteSort()
@@ -296,8 +300,8 @@ internal class ComXParser(context: MangaLoaderContext) :
 			}
 
 			result += MangaChapter(
-				id = generateUid("/"),
-				url = "/reader//",
+				id = generateUid("$comicId/$chapterId"),
+				url = "/reader/$comicId/$chapterId",
 				number = number,
 				title = title,
 				uploadDate = dateFormat.parseSafe(chapter.getStringOrNull("date")),
@@ -317,7 +321,7 @@ internal class ComXParser(context: MangaLoaderContext) :
 	}
 
 	private fun Document.pageListItem(label: String): String? =
-		selectFirst(".page__list > li:has(> div:contains())")?.let { element ->
+		selectFirst(".page__list > li:has(> div:contains($label))")?.let { element ->
 			element.selectFirst("a")?.text() ?: element.ownText()
 		}?.trim()?.nullIfEmpty()
 
@@ -334,7 +338,7 @@ internal class ComXParser(context: MangaLoaderContext) :
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val comicId = chapter.url.substringAfter("/reader/").substringBefore('/')
-		context.cookieJar.insertCookies(domain, "adult=; Path=/")
+		context.cookieJar.insertCookies(domain, "adult=$comicId; Path=/")
 		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain), getRequestHeaders()).parseHtml()
 		if (doc.html().contains("Выпуск был удален по требованию правообладателя")) {
 			throw ParseException("Выпуск удалён по требованию правообладателя", chapter.url)
@@ -358,7 +362,7 @@ internal class ComXParser(context: MangaLoaderContext) :
 				imageBase + path.trimStart('/')
 			}
 			MangaPage(
-				id = generateUid("${chapter.id}-"),
+				id = generateUid("${chapter.id}-$index"),
 				url = imageUrl,
 				preview = null,
 				source = source,
@@ -367,13 +371,13 @@ internal class ComXParser(context: MangaLoaderContext) :
 	}
 
 	private fun String.toImageBaseUrl(): String {
-		val hostUrl = if (startsWith("http://") || startsWith("https://")) this else "https://"
+		val hostUrl = if (startsWith("http://") || startsWith("https://")) this else "https://$this"
 		val normalized = hostUrl.trimEnd('/')
-		return if (normalized.endsWith("/comix")) "/" else "/comix/"
+		return if (normalized.endsWith("/comix")) "$normalized/" else "$normalized/comix/"
 	}
 
 	private suspend fun fetchFilterData(): SiteFilterData {
-		val url = "https:///comix-read/"
+		val url = "https://$domain/comix-read/"
 		val doc = webClient.httpGet(url, getRequestHeaders()).parseHtml()
 		val root = doc.windowJson("window.__XFILTER__", url)
 		val filterItems = root.optJSONObject("filter_items")
@@ -383,10 +387,10 @@ internal class ComXParser(context: MangaLoaderContext) :
 			tags += MangaTag(key = id, title = title.toTitleCase(sourceLocale), source = source)
 		}
 		filterItems.filterValues("p.cat").forEach { (id, title) ->
-			tags += MangaTag(key = "p.cat:", title = "Раздел: ", source = source)
+			tags += MangaTag(key = "p.cat:$id", title = "Раздел: $title", source = source)
 		}
 		filterItems.filterValues("t").forEach { (id, title) ->
-			tags += MangaTag(key = "t:", title = "Тип выпуска: ", source = source)
+			tags += MangaTag(key = "t:$id", title = "Тип выпуска: $title", source = source)
 		}
 		val statusIds = buildMap {
 			filterItems.filterValues("st").forEach { (id, title) ->
@@ -405,11 +409,11 @@ internal class ComXParser(context: MangaLoaderContext) :
 	}
 
 	private fun Document.windowJson(variable: String, url: String): JSONObject {
-		val script = selectFirst("script:containsData()")?.data()
-			?: throw ParseException(" data not found", url)
+		val script = selectFirst("script:containsData($variable)")?.data()
+			?: throw ParseException("$variable data not found", url)
 		val assignment = script.indexOf(variable)
 		val start = script.indexOf('{', assignment)
-		if (assignment < 0 || start < 0) throw ParseException(" data not found", url)
+		if (assignment < 0 || start < 0) throw ParseException("$variable data not found", url)
 		var depth = 0
 		var inString = false
 		var escaped = false
@@ -426,12 +430,12 @@ internal class ComXParser(context: MangaLoaderContext) :
 				}
 			}
 		}
-		throw ParseException("Invalid  data", url)
+		throw ParseException("Invalid $variable data", url)
 	}
 
 	private fun String.decodeWebViewString(): String {
 		if (length < 2 || first() != '"' || last() != '"') return this
-		return runCatching { JSONObject("{\"value\":}").getString("value") }
+		return runCatching { JSONObject("""{"value":$this}""").getString("value") }
 			.getOrDefault(removeSurrounding("\""))
 	}
 
@@ -464,24 +468,14 @@ internal class ComXParser(context: MangaLoaderContext) :
 			"bonus",
 		)
 		private val DLE_GUARD_SCRIPT = """
-			(() => new Promise(resolve => {
-				const finish = () => {
-					const cookies = document.cookie || "";
-					if (cookies.split(';').some(cookie => cookie.trim().startsWith('__guard_trust='))) {
-						resolve(cookies);
-						return true;
-					}
-					return false;
-				};
-				if (finish()) return;
-				const timer = setInterval(() => {
-					if (finish()) clearInterval(timer);
-				}, 250);
-				setTimeout(() => {
-					clearInterval(timer);
-					resolve(document.cookie || "");
-				}, 28000);
-			}))();
+			(() => {
+				const cookies = document.cookie || "";
+				return cookies
+					.split(';')
+					.some(cookie => cookie.trim().startsWith('__guard_trust='))
+					? cookies
+					: null;
+			})();
 		""".trimIndent()
 	}
 }
