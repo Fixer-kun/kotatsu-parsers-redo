@@ -225,7 +225,17 @@ internal abstract class OniSagaParser(
 
 	private fun parseDetails(document: Document, fallback: Manga): Manga {
 		val infoSection = document.selectFirst("div.flex.flex-col.md\\:flex-row")
-		val title = document.selectFirst("h1, [data-flux-heading]")?.text()?.nullIfEmpty() ?: fallback.title
+		val title = (
+			infoSection?.select("h1")
+				?.asSequence()
+				?.mapNotNull { it.text().trim().nullIfEmpty() }
+				?.firstOrNull { !it.equals("Search", ignoreCase = true) }
+				?: document.select("h1")
+					.asSequence()
+					.mapNotNull { it.text().trim().nullIfEmpty() }
+					.firstOrNull { !it.equals("Search", ignoreCase = true) }
+			)
+			?: fallback.title
 		val cover = document.selectFirst(".w-32 > picture img, div.flex.flex-col.md\\:flex-row picture img")
 			?.resolveImageUrl()
 			?: fallback.coverUrl
@@ -252,7 +262,7 @@ internal abstract class OniSagaParser(
 			coverUrl = cover,
 			largeCoverUrl = cover,
 			rating = rating,
-			contentRating = if (document.selectFirst("span:containsOwn(18+)") != null) {
+			contentRating = if (infoSection?.selectFirst("span:containsOwn(18+)") != null) {
 				ContentRating.ADULT
 			} else {
 				ContentRating.SAFE

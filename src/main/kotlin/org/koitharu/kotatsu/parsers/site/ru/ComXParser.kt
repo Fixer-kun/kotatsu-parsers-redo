@@ -251,7 +251,6 @@ internal class ComXParser(context: MangaLoaderContext) :
 				!tag.key.contains(':') && tag.title.equals(name, ignoreCase = true)
 			}
 		}
-
 		return manga.copy(
 			title = doc.selectFirst("header.page__header h1")?.textOrNull() ?: manga.title,
 			altTitles = manga.altTitles + setOfNotNull(originalTitle),
