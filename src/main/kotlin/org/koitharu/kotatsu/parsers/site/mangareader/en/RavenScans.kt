@@ -15,5 +15,4 @@ internal class RavenScans(context: MangaLoaderContext) :
 		get() = super.filterCapabilities.copy(
 			isTagsExclusionSupported = false,
 		)
-
 }
