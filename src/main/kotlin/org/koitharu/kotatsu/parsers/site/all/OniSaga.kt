@@ -57,13 +57,21 @@ internal abstract class OniSagaParser(
 		isYearSupported = true,
 	)
 
-	private val readerRateLock = Mutex()
+	private val readerSignRateLock = Mutex()
 
 	@Volatile
-	private var lastReaderRequestStartedAt = 0L
+	private var lastReaderSignRequestStartedAt = 0L
 
 	@Volatile
-	private var readerBackoffUntil = 0L
+	private var readerSignBackoffUntil = 0L
+
+	private val readerBootstrapRateLock = Mutex()
+
+	@Volatile
+	private var lastReaderBootstrapRequestStartedAt = 0L
+
+	@Volatile
+	private var readerBootstrapBackoffUntil = 0L
 
 	private val readerTokens = object : LinkedHashMap<String, String>(READER_TOKEN_CACHE_SIZE, 0.75f, true) {
 		override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean =
@@ -491,7 +499,7 @@ internal abstract class OniSagaParser(
 			var shouldRefreshToken = false
 			val imageUrl = try {
 				val token = getReaderToken(chapterUrl) ?: loadReaderToken(chapterUrl)
-				awaitReaderRequestSlot()
+				awaitReaderSignRequestSlot()
 				val response = webClient.httpGet(apiUrl, readerHeaders(token, chapterUrl))
 				response.header("x-reader-token-next")?.nullIfEmpty()?.let {
 					putReaderToken(chapterUrl, it)
@@ -514,8 +522,8 @@ internal abstract class OniSagaParser(
 						shouldRefreshToken = true
 					}
 					429 -> {
-						readerBackoffUntil = maxOf(
-							readerBackoffUntil,
+						readerSignBackoffUntil = maxOf(
+							readerSignBackoffUntil,
 							System.currentTimeMillis() + READER_429_BACKOFF_MILLIS,
 						)
 					}
@@ -523,7 +531,7 @@ internal abstract class OniSagaParser(
 				}
 				null
 			} catch (error: TooManyRequestExceptions) {
-				registerReaderBackoff(error)
+				registerReaderSignBackoff(error)
 				null
 			}
 			if (imageUrl != null) {
@@ -535,11 +543,24 @@ internal abstract class OniSagaParser(
 		throw ParseException("Failed to fetch image after $READER_RETRIES attempts", apiUrl)
 	}
 
-	private suspend fun awaitReaderRequestSlot() = readerRateLock.withLock {
+	private suspend fun awaitReaderSignRequestSlot() = readerSignRateLock.withLock {
 		val now = System.currentTimeMillis()
-		val nextStart = maxOf(lastReaderRequestStartedAt + READER_REQUEST_INTERVAL_MILLIS, readerBackoffUntil)
+		val nextStart = maxOf(
+			lastReaderSignRequestStartedAt + READER_SIGN_REQUEST_INTERVAL_MILLIS,
+			readerSignBackoffUntil,
+		)
 		if (nextStart > now) delay(nextStart - now)
-		lastReaderRequestStartedAt = System.currentTimeMillis()
+		lastReaderSignRequestStartedAt = System.currentTimeMillis()
+	}
+
+	private suspend fun awaitReaderBootstrapRequestSlot() = readerBootstrapRateLock.withLock {
+		val now = System.currentTimeMillis()
+		val nextStart = maxOf(
+			lastReaderBootstrapRequestStartedAt + READER_BOOTSTRAP_REQUEST_INTERVAL_MILLIS,
+			readerBootstrapBackoffUntil,
+		)
+		if (nextStart > now) delay(nextStart - now)
+		lastReaderBootstrapRequestStartedAt = System.currentTimeMillis()
 	}
 
 	private suspend fun loadReaderToken(chapterUrl: String): String {
@@ -553,7 +574,7 @@ internal abstract class OniSagaParser(
 		var pagesMissing = false
 		repeat(READER_RETRIES) { attempt ->
 			try {
-				awaitReaderRequestSlot()
+				awaitReaderBootstrapRequestSlot()
 				val body = webClient.httpGet(chapterUrl).parseRaw()
 				val token = extractReaderToken(body, chapterUrl)
 				val orders = PAGE_ORDER_REGEX.findAll(body)
@@ -568,13 +589,13 @@ internal abstract class OniSagaParser(
 					return ReaderState(token, orders).also { cacheReaderState(chapterUrl, it) }
 				}
 				if (attempt + 1 < READER_RETRIES) {
-					readerBackoffUntil = maxOf(
-						readerBackoffUntil,
+					readerBootstrapBackoffUntil = maxOf(
+						readerBootstrapBackoffUntil,
 						System.currentTimeMillis() + READER_TOKEN_RETRY_MILLIS,
 					)
 				}
 			} catch (error: TooManyRequestExceptions) {
-				registerReaderBackoff(error)
+				registerReaderBootstrapBackoff(error)
 			}
 		}
 		val message = when {
@@ -618,10 +639,18 @@ internal abstract class OniSagaParser(
 		)
 	}
 
-	private fun registerReaderBackoff(error: TooManyRequestExceptions) {
+	private fun registerReaderSignBackoff(error: TooManyRequestExceptions) {
 		val retryDelay = error.getRetryDelay().takeIf { it > 0L } ?: READER_429_BACKOFF_MILLIS
-		readerBackoffUntil = maxOf(
-			readerBackoffUntil,
+		readerSignBackoffUntil = maxOf(
+			readerSignBackoffUntil,
+			System.currentTimeMillis() + retryDelay + READER_RETRY_MARGIN_MILLIS,
+		)
+	}
+
+	private fun registerReaderBootstrapBackoff(error: TooManyRequestExceptions) {
+		val retryDelay = error.getRetryDelay().takeIf { it > 0L } ?: READER_429_BACKOFF_MILLIS
+		readerBootstrapBackoffUntil = maxOf(
+			readerBootstrapBackoffUntil,
 			System.currentTimeMillis() + retryDelay + READER_RETRY_MARGIN_MILLIS,
 		)
 	}
@@ -916,7 +945,8 @@ internal abstract class OniSagaParser(
 		const val CHAPTER_LOAD_BATCH = 10
 		const val MAX_CHAPTER_REQUESTS = 10
 		const val READER_RETRIES = 3
-		const val READER_REQUEST_INTERVAL_MILLIS = 500L
+		const val READER_SIGN_REQUEST_INTERVAL_MILLIS = 250L
+		const val READER_BOOTSTRAP_REQUEST_INTERVAL_MILLIS = 500L
 		const val READER_429_BACKOFF_MILLIS = 10_000L
 		const val READER_TOKEN_RETRY_MILLIS = 1_000L
 		const val READER_RETRY_MARGIN_MILLIS = 250L
