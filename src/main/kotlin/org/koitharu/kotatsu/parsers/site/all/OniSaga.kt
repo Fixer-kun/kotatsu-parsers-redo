@@ -188,11 +188,13 @@ internal abstract class OniSagaParser(
 			method = "gotoPage",
 			params = JSONArray().put(page.toString()),
 		)
-		val response = webClient.httpPost(
-			"https://$domain/livewire/update".toHttpUrl(),
-			payload,
-			livewireHeaders(pageUrl),
-		).parseJson()
+		val response = livewireRequestLock.withLock {
+			webClient.httpPost(
+				"https://$domain/livewire/update".toHttpUrl(),
+				payload,
+				livewireHeaders(pageUrl),
+			).parseJson()
+		}
 		val component = response.firstComponent()
 			?: throw ParseException("Empty Livewire browse response", pageUrl)
 		val html = component
@@ -271,9 +273,18 @@ internal abstract class OniSagaParser(
 		val detailsKey = "${source.name}\n$detailsUrl"
 		getCachedMangaDetails(detailsKey)?.let { return it }
 		return getMangaDetailsLock(detailsKey).withLock {
-			getCachedMangaDetails(detailsKey) ?: loadDetailsDocument(detailsUrl)?.let { document ->
+			getCachedMangaDetails(detailsKey) ?: loadMangaDocument(detailsUrl)?.let { document ->
 				parseDetails(document, manga).copy(chapters = fetchChapters(document))
 			}?.also { cacheMangaDetails(detailsKey, it) } ?: manga
+		}
+	}
+
+	private suspend fun loadMangaDocument(url: String): Document? {
+		getCachedMangaDocument(url)?.let { return it }
+		return getMangaDocumentLock(url).withLock {
+			getCachedMangaDocument(url) ?: loadDetailsDocument(url)?.also {
+				cacheMangaDocument(url, it)
+			}
 		}
 	}
 
@@ -309,6 +320,7 @@ internal abstract class OniSagaParser(
 		synchronized(ACTIVE_LIST_STATES) { ACTIVE_LIST_STATES.clear() }
 		synchronized(MANGA_LISTS) { MANGA_LISTS.clear() }
 		synchronized(MANGA_DETAILS) { MANGA_DETAILS.clear() }
+		synchronized(MANGA_DOCUMENTS) { MANGA_DOCUMENTS.clear() }
 		synchronized(readerTokens) { readerTokens.clear() }
 		synchronized(readerPageUrls) { readerPageUrls.clear() }
 		synchronized(readerChapterStates) { readerChapterStates.clear() }
@@ -390,21 +402,43 @@ internal abstract class OniSagaParser(
 		val visibleLanguages = document.select("a[href*='/read/']")
 			.mapNotNullTo(linkedSetOf()) { it.chapterLanguage() }
 		val selectedLanguage = state?.selectedChapterLanguage() ?: visibleLanguages.singleOrNull()
-		val initialChapters = if (languageCode == null) {
-			parseAllLanguageChapters(document, state?.activeChapterLanguage() ?: selectedLanguage)
-		} else {
+		val requestedLanguage = languageCode
+		if (requestedLanguage != null) {
+			val initialChapters = parseChapters(
+				document = document,
+				language = requestedLanguage,
+				matchLanguage = selectedLanguage != requestedLanguage,
+			)
+			if (state == null || initialChapters.isNotEmpty() && !document.hasMoreChapters()) {
+				return initialChapters
+			}
+			return runCatchingCancellable {
+				fetchChapterBatch(document.location(), state, requestedLanguage, initialChapters)
+			}.getOrElse { initialChapters }
+		}
+
+		val fallbackLanguage = state?.activeChapterLanguage() ?: selectedLanguage ?: DEFAULT_CHAPTER_LANGUAGE
+		val initialByLanguage = LANGUAGE_CODES.associateWith { code ->
 			parseChapters(
 				document = document,
-				language = languageCode,
-				matchLanguage = selectedLanguage != languageCode,
+				language = code,
+				matchLanguage = true,
+				includeUnlabeled = code == fallbackLanguage,
 			)
 		}
-		if (state == null || initialChapters.isNotEmpty() && !document.hasMoreChapters()) {
-			return initialChapters
+		if (state == null) return normalizeChapters(initialByLanguage.values.flatten())
+		val chapters = ArrayList<MangaChapter>()
+		for (code in LANGUAGE_CODES) {
+			val fallback = initialByLanguage.getValue(code)
+			if (code == selectedLanguage && fallback.isNotEmpty() && !document.hasMoreChapters()) {
+				chapters += fallback
+				continue
+			}
+			chapters += runCatchingCancellable {
+				fetchChapterBatch(document.location(), state, code, fallback)
+			}.getOrElse { fallback }
 		}
-		return runCatchingCancellable {
-			fetchChapterBatch(document.location(), state, languageCode, initialChapters)
-		}.getOrElse { initialChapters }
+		return normalizeChapters(chapters)
 	}
 
 	private fun normalizeChapters(chapters: List<MangaChapter>): List<MangaChapter> = chapters
@@ -417,39 +451,32 @@ internal abstract class OniSagaParser(
 	private suspend fun fetchChapterBatch(
 		referer: String,
 		initialState: LivewireState,
-		code: String?,
+		code: String,
 		fallback: List<MangaChapter>,
 	): List<MangaChapter> {
 		var snapshot = initialState.snapshot
 		var previousSize = fallback.size
 		var chapters = fallback
-		repeat(MAX_CHAPTER_REQUESTS) {
-			val response = webClient.httpPost(
-				"https://$domain/livewire/update".toHttpUrl(),
-				createLivewirePayload(
-					state = LivewireState(snapshot, initialState.token),
-					updates = JSONObject().put("language", code ?: JSONObject.NULL),
-					method = "loadMoreChapters",
-					params = JSONArray(),
-					callCount = CHAPTER_LOAD_BATCH,
-				),
-				livewireHeaders(referer),
-			).parseJson()
+		repeat(MAX_CHAPTER_REQUESTS) { requestIndex ->
+			val callCount = if (requestIndex == 0 && fallback.isEmpty()) CHAPTER_PROBE_BATCH else CHAPTER_LOAD_BATCH
+			val response = livewireRequestLock.withLock {
+				webClient.httpPost(
+					"https://$domain/livewire/update".toHttpUrl(),
+					createLivewirePayload(
+						state = LivewireState(snapshot, initialState.token),
+						updates = JSONObject().put("language", code),
+						method = "loadMoreChapters",
+						params = JSONArray(),
+						callCount = callCount,
+					),
+					livewireHeaders(referer),
+				).parseJson()
+			}
 			val component = response.firstComponent() ?: return chapters
 			val html = component.optJSONObject("effects")?.getStringOrNull("html") ?: return chapters
 			val chapterDocument = Jsoup.parseBodyFragment(html, "https://$domain")
 			val nextSnapshot = component.getStringOrNull("snapshot")
-			val parsed = if (code == null) {
-				parseAllLanguageChapters(
-					chapterDocument,
-					nextSnapshot
-						?.let { LivewireState(it, initialState.token) }
-						?.activeChapterLanguage()
-						?: initialState.activeChapterLanguage(),
-				)
-			} else {
-				parseChapters(chapterDocument, code)
-			}
+			val parsed = parseChapters(chapterDocument, code)
 			if (parsed.size <= previousSize) return chapters
 			chapters = parsed
 			previousSize = parsed.size
@@ -536,18 +563,6 @@ internal abstract class OniSagaParser(
 				)
 			}
 		}
-	}
-
-	private fun parseAllLanguageChapters(document: Document, unlabeledLanguage: String?): List<MangaChapter> {
-		val fallbackLanguage = unlabeledLanguage ?: DEFAULT_CHAPTER_LANGUAGE
-		return LANGUAGE_CODES.flatMap { code ->
-			parseChapters(
-				document = document,
-				language = code,
-				matchLanguage = true,
-				includeUnlabeled = code == fallbackLanguage,
-			)
-		}.let(::normalizeChapters)
 	}
 
 	private fun Element.chapterLanguage(): String? =
@@ -846,7 +861,7 @@ internal abstract class OniSagaParser(
 		.build()
 
 	override suspend fun getRelatedManga(seed: Manga): List<Manga> {
-		val document = webClient.httpGet(seed.url.toAbsoluteUrl(domain)).parseHtml()
+		val document = loadMangaDocument(seed.url.toAbsoluteUrl(domain)) ?: return emptyList()
 		val heading = document.select("div[data-flux-heading], h3, h2").firstOrNull {
 			val text = it.text().lowercase(Locale.ROOT)
 			"recommended" in text || "related" in text || "you may also like" in text
@@ -870,7 +885,7 @@ internal abstract class OniSagaParser(
 				?: return null
 			else -> return null
 		}
-		val document = webClient.httpGet(mangaUrl).parseHtml()
+		val document = loadMangaDocument(mangaUrl) ?: return null
 		val slug = mangaUrl.toHttpUrl().pathSegments.last()
 		val stub = Manga(
 			id = generateUid("/manga/$slug"),
@@ -1003,6 +1018,24 @@ internal abstract class OniSagaParser(
 		MANGA_DETAILS[key] = CachedMangaDetails(manga, System.currentTimeMillis())
 	}
 
+	private fun getMangaDocumentLock(url: String): Mutex = synchronized(MANGA_DOCUMENT_LOCKS) {
+		MANGA_DOCUMENT_LOCKS.getOrPut(url, ::Mutex)
+	}
+
+	private fun getCachedMangaDocument(url: String): Document? = synchronized(MANGA_DOCUMENTS) {
+		val cached = MANGA_DOCUMENTS[url] ?: return@synchronized null
+		if (System.currentTimeMillis() - cached.createdAt > MANGA_DOCUMENT_CACHE_TTL) {
+			MANGA_DOCUMENTS.remove(url)
+			null
+		} else {
+			cached.document
+		}
+	}
+
+	private fun cacheMangaDocument(url: String, document: Document) = synchronized(MANGA_DOCUMENTS) {
+		MANGA_DOCUMENTS[url] = CachedMangaDocument(document, System.currentTimeMillis())
+	}
+
 	private fun JSONObject.firstComponent(): JSONObject? = optJSONArray("components")?.optJSONObject(0)
 
 	private fun MangaListFilter.toLivewireUpdates(order: SortOrder): LivewireUpdates {
@@ -1049,6 +1082,7 @@ internal abstract class OniSagaParser(
 	private data class CachedLivewireState(val state: LivewireState, val createdAt: Long)
 	private data class CachedMangaList(val manga: List<Manga>, val createdAt: Long)
 	private data class CachedMangaDetails(val manga: Manga, val createdAt: Long)
+	private data class CachedMangaDocument(val document: Document, val createdAt: Long)
 	private data class CachedPageUrl(val url: String, val expiresAt: Long)
 	private data class ReaderState(val token: String, val orders: List<Int>)
 	private data class CachedReaderState(val state: ReaderState, val expiresAt: Long)
@@ -1146,6 +1180,7 @@ internal abstract class OniSagaParser(
 	private companion object {
 		const val PAGE_SIZE = 24
 		const val CHAPTER_LOAD_BATCH = 50
+		const val CHAPTER_PROBE_BATCH = 1
 		const val MAX_CHAPTER_REQUESTS = 10
 		const val DETAILS_RETRIES = 3
 		const val DETAILS_RETRY_DELAY_MILLIS = 300L
@@ -1167,6 +1202,7 @@ internal abstract class OniSagaParser(
 		const val MANGA_LIST_CACHE_TTL = 60_000L
 		const val MANGA_DETAILS_CACHE_SIZE = 32
 		const val MANGA_DETAILS_CACHE_TTL = 60_000L
+		const val MANGA_DOCUMENT_CACHE_TTL = 60_000L
 		const val IMAGE_REFERER_FRAGMENT = "onisaga-ref:"
 		const val POST_FILTER_COMPONENT = "post-filter"
 		const val CHAPTER_LIST_COMPONENT = "manga.chapter-list"
@@ -1180,6 +1216,7 @@ internal abstract class OniSagaParser(
 		const val YEAR_MILLIS = 31_536_000_000L
 
 		val readerSignRateLock = Mutex()
+		val livewireRequestLock = Mutex()
 		val readerSignStateLock = Any()
 		val serverSessionLock = Any()
 
@@ -1247,6 +1284,15 @@ internal abstract class OniSagaParser(
 				size > MANGA_DETAILS_CACHE_SIZE
 		}
 		val MANGA_DETAILS_LOCKS = object : LinkedHashMap<String, Mutex>(MANGA_DETAILS_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
+				size > MANGA_DETAILS_CACHE_SIZE
+		}
+		val MANGA_DOCUMENTS = object :
+			LinkedHashMap<String, CachedMangaDocument>(MANGA_DETAILS_CACHE_SIZE, 0.75f, true) {
+			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedMangaDocument>?): Boolean =
+				size > MANGA_DETAILS_CACHE_SIZE
+		}
+		val MANGA_DOCUMENT_LOCKS = object : LinkedHashMap<String, Mutex>(MANGA_DETAILS_CACHE_SIZE, 0.75f, true) {
 			override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Mutex>?): Boolean =
 				size > MANGA_DETAILS_CACHE_SIZE
 		}
