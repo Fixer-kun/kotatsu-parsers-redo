@@ -271,10 +271,48 @@ internal abstract class OniSagaParser(
 		val detailsKey = "${source.name}\n$detailsUrl"
 		getCachedMangaDetails(detailsKey)?.let { return it }
 		return getMangaDetailsLock(detailsKey).withLock {
-			getCachedMangaDetails(detailsKey) ?: webClient.httpGet(detailsUrl).parseHtml().let { document ->
+			getCachedMangaDetails(detailsKey) ?: loadDetailsDocument(detailsUrl)?.let { document ->
 				parseDetails(document, manga).copy(chapters = fetchChapters(document))
-			}.also { cacheMangaDetails(detailsKey, it) }
+			}?.also { cacheMangaDetails(detailsKey, it) } ?: manga
 		}
+	}
+
+	private suspend fun loadDetailsDocument(url: String): Document? {
+		repeat(DETAILS_RETRIES) { attempt ->
+			try {
+				return webClient.httpGet(url).parseHtml()
+			} catch (error: HttpStatusException) {
+				if (error.statusCode !in 500..599) return null
+				if (attempt == 0) resetServerSession()
+			} catch (error: TooManyRequestExceptions) {
+				if (attempt + 1 < DETAILS_RETRIES) {
+					delay(maxOf(DETAILS_RETRY_DELAY_MILLIS, error.getRetryDelay()))
+				}
+				return@repeat
+			}
+			if (attempt + 1 < DETAILS_RETRIES) {
+				delay(DETAILS_RETRY_DELAY_MILLIS * (attempt + 1))
+			}
+		}
+		return null
+	}
+
+	private fun resetServerSession() = synchronized(serverSessionLock) {
+		val now = System.currentTimeMillis()
+		if (now - lastServerSessionResetAt < SERVER_SESSION_RESET_COOLDOWN_MILLIS) return@synchronized
+		context.cookieJar.insertCookies(
+			domain,
+			"XSRF-TOKEN=; Max-Age=0; Path=/; Secure; SameSite=Lax",
+			"onisaga_session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax",
+		)
+		synchronized(INITIAL_LIST_STATES) { INITIAL_LIST_STATES.clear() }
+		synchronized(ACTIVE_LIST_STATES) { ACTIVE_LIST_STATES.clear() }
+		synchronized(MANGA_LISTS) { MANGA_LISTS.clear() }
+		synchronized(MANGA_DETAILS) { MANGA_DETAILS.clear() }
+		synchronized(readerTokens) { readerTokens.clear() }
+		synchronized(readerPageUrls) { readerPageUrls.clear() }
+		synchronized(readerChapterStates) { readerChapterStates.clear() }
+		lastServerSessionResetAt = now
 	}
 
 	private fun parseDetails(document: Document, fallback: Manga): Manga {
@@ -1107,8 +1145,11 @@ internal abstract class OniSagaParser(
 
 	private companion object {
 		const val PAGE_SIZE = 24
-		const val CHAPTER_LOAD_BATCH = 100
+		const val CHAPTER_LOAD_BATCH = 50
 		const val MAX_CHAPTER_REQUESTS = 10
+		const val DETAILS_RETRIES = 3
+		const val DETAILS_RETRY_DELAY_MILLIS = 300L
+		const val SERVER_SESSION_RESET_COOLDOWN_MILLIS = 5_000L
 		const val READER_RETRIES = 3
 		const val READER_SIGN_REQUEST_INTERVAL_MILLIS = 250L
 		const val READER_429_BACKOFF_MILLIS = 10_000L
@@ -1140,6 +1181,10 @@ internal abstract class OniSagaParser(
 
 		val readerSignRateLock = Mutex()
 		val readerSignStateLock = Any()
+		val serverSessionLock = Any()
+
+		@Volatile
+		var lastServerSessionResetAt = 0L
 
 		@Volatile
 		var lastReaderSignRequestStartedAt = 0L
